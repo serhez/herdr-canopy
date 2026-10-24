@@ -1,100 +1,53 @@
-id = "beyondlex.herdr-recent-navigator"
-name = "Herdr Recent Navigator"
-version = "0.6.5"
-description = "Recent workspaces, tabs, panes, and AI agents switcher for Herdr."
-min_herdr_version = "0.7.4"
+id = "serhez.herdr-canopy"
+name = "Herdr Canopy"
+version = "1.0.0"
+description = "Attention-aware tree navigation for workspaces, worktrees, tabs, and agent panes."
+min_herdr_version = "0.9.5"
 platforms = ["macos", "linux"]
 
 [[build]]
-command = ["cargo", "build", "--release"]
-platforms = ["macos", "linux"]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[actions]]
+id = "toggle"
+title = "Toggle workspace tree"
+contexts = ["global", "workspace"]
+command = ["./target/release/herdr-canopy", "toggle"]
 
 [[actions]]
 id = "open"
-title = "Open Navigator"
-description = "Open the recent items navigator"
+title = "Open workspace tree"
 contexts = ["global", "workspace"]
-command = ["./target/release/herdr-recent-navigator", "--pane-open"]
-
-[[actions]]
-id = "focus-workspaces"
-title = "Quick Focus: Workspaces"
-description = "Open navigator focused on Workspaces tab"
-contexts = ["global", "workspace"]
-command = ["./target/release/herdr-recent-navigator", "--pane-open", "--view", "workspaces"]
-
-[[actions]]
-id = "focus-tabs"
-title = "Quick Focus: Tabs"
-description = "Open navigator focused on Tabs tab"
-contexts = ["global", "workspace"]
-command = ["./target/release/herdr-recent-navigator", "--pane-open", "--view", "tabs"]
-
-[[actions]]
-id = "focus-agents"
-title = "Quick Focus: Agents"
-description = "Open navigator focused on Agents tab"
-contexts = ["global", "workspace"]
-command = ["./target/release/herdr-recent-navigator", "--pane-open", "--view", "agents"]
-
-[[actions]]
-id = "focus-panes"
-title = "Quick Focus: Panes"
-description = "Open navigator focused on Panes tab"
-contexts = ["global", "workspace"]
-command = ["./target/release/herdr-recent-navigator", "--pane-open", "--view", "panes"]
-
-[[actions]]
-id = "focus-all"
-title = "Quick Focus: All"
-description = "Open navigator focused on All tab (cmd/ssh/cwd + full-text buffer search)"
-contexts = ["global", "workspace"]
-command = ["./target/release/herdr-recent-navigator", "--pane-open", "--view", "all"]
-
-[[actions]]
-id = "focus-previous-tab"
-title = "Quick Focus: Previous Tab"
-description = "Jump to the most recently focused tab without opening the navigator"
-contexts = ["global", "workspace"]
-command = ["./target/release/herdr-recent-navigator", "quick-focus-previous-tab"]
-
-[[actions]]
-id = "focus-previous-pane"
-title = "Quick Focus: Previous Pane"
-description = "Jump to the most recently focused pane without opening the navigator"
-contexts = ["global", "workspace"]
-command = ["./target/release/herdr-recent-navigator", "quick-focus-previous-pane"]
-
-[[actions]]
-id = "focus-previous-agent"
-title = "Quick Focus: Previous Agent"
-description = "Jump to the most recently used agent without opening the navigator"
-contexts = ["global", "workspace"]
-command = ["./target/release/herdr-recent-navigator", "quick-focus-previous-agent"]
+command = ["./target/release/herdr-canopy", "--pane-open"]
 
 [[events]]
 on = "workspace.focused"
-command = ["./target/release/herdr-recent-navigator", "track"]
-
-[[events]]
-on = "pane.focused"
-command = ["./target/release/herdr-recent-navigator", "track"]
+command = ["./target/release/herdr-canopy", "track"]
 
 [[events]]
 on = "tab.focused"
-command = ["./target/release/herdr-recent-navigator", "track"]
+command = ["./target/release/herdr-canopy", "track"]
+
+[[events]]
+on = "pane.focused"
+command = ["./target/release/herdr-canopy", "track"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./target/release/herdr-canopy", "track-work"]
+
+[[events]]
+on = "pane.closed"
+command = ["./target/release/herdr-canopy", "track-work"]
+
+[[events]]
+on = "pane.exited"
+command = ["./target/release/herdr-canopy", "track-work"]
 
 [[panes]]
 id = "navigator"
-title = "Recent Navigator"
+title = "Canopy"
 placement = "popup"
-width = "60%"
-command = ["./target/release/herdr-recent-navigator"]
-
-# Optional: order and visibility of the navigator's category tabs. The array
-# carries both — position is display order, a tab left out is hidden.
-# Valid names: workspaces, tabs, panes, agents, all (others = legacy alias).
-# At least one tab is enforced (an empty or all-invalid list falls back to
-# ["all"]).
-# [navigator]
-# tabs = ["workspaces", "tabs", "panes", "agents", "all"]
+width = 65
+height = 30
+command = ["./target/release/herdr-canopy"]

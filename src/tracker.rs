@@ -1,370 +1,638 @@
-use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::path::PathBuf;
-
-use anyhow::Context;
+use crate::models::{ActiveLocation, AgentActivity, AgentProvider, AgentStatus, History, Snapshot};
+use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The entity kind that was focused. Used to tag MRU entries so we can
-/// apply pane-level, tab-level, and workspace-level timestamps independently.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub enum MruKind {
-    Pane,
-    Tab,
-    Workspace,
+pub struct Tracker {
+    path: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct MruEntry {
-    pub kind: MruKind,
-    /// The entity ID: pane_id, tab_id, or workspace_id depending on `kind`.
-    pub id: String,
-    /// The workspace that the focused entity belongs to.
-    pub workspace_id: String,
-    pub focused_at: u64,
-    /// Human-readable name for the entity (tab label, pane label, workspace label).
-    /// Used for debugging; populated when the caller has the data.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Human-readable workspace label for context.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_name: Option<String>,
+pub struct WorkingTracker {
+    path: PathBuf,
 }
 
-/// Return the path to the state directory, or a default fallback.
-pub fn state_dir_or_default() -> PathBuf {
-    std::env::var("HERDR_PLUGIN_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/herdr-recent-navigator"))
+#[derive(Default, Deserialize, Serialize)]
+pub struct WorkingHistory {
+    periods: HashMap<String, WorkingPeriod>,
 }
 
-/// Path to the MRU data file.
-fn mru_path() -> PathBuf {
-    state_dir_or_default().join("mru.json")
+#[derive(Deserialize, Serialize)]
+struct WorkingPeriod {
+    terminal_id: String,
+    provider: AgentProvider,
+    sequence: u64,
+    started_ms: u64,
 }
 
-/// Path to the cross-process lock file.
-fn lock_path() -> PathBuf {
-    state_dir_or_default().join("mru.lock")
+pub fn unix_millis() -> Result<u64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
 }
 
-/// Acquire an exclusive lock on the lock file.
-/// Blocks until the lock is acquired. Returns the locked file handle.
-/// The lock is automatically released when the handle is dropped.
-fn acquire_lock() -> anyhow::Result<File> {
-    let path = lock_path();
+fn lock_state(path: &Path) -> Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = OpenOptions::new()
+    let lock = OpenOptions::new()
         .create(true)
-        .write(true)
-        .read(true)
         .truncate(false)
-        .open(&path)
-        .with_context(|| format!("Failed to open lock file: {}", path.display()))?;
-    file.lock_exclusive()?;
-    Ok(file)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    lock.lock_exclusive()?;
+    Ok(lock)
 }
 
-/// Record a focus event (pane/tab/workspace): persist a timestamped entry to the MRU file.
-pub fn record_event(kind: MruKind, id: &str, workspace_id: &str) -> anyhow::Result<()> {
-    record_event_with_names(kind, id, workspace_id, None, None)
-}
-
-/// Same as record_event but with human-readable names for logging/debugging.
-///
-/// Uses a cross-process lock file (`mru.lock`) to serialize concurrent writes
-/// from multiple `track` subcommand processes that Herdr fires simultaneously.
-pub fn record_event_with_names(
-    kind: MruKind,
-    id: &str,
-    workspace_id: &str,
-    name: Option<String>,
-    workspace_name: Option<String>,
-) -> anyhow::Result<()> {
-    let path = mru_path();
-    let _lock = acquire_lock()?;
-
-    let now = chrono::Utc::now().timestamp_millis() as u64;
-
-    let mut entries: Vec<MruEntry> = fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default();
-
-    let old = entries
-        .iter()
-        .find(|e| e.kind == kind && e.id == id)
-        .cloned();
-    entries.retain(|e| !(e.kind == kind && e.id == id));
-
-    entries.insert(
-        0,
-        MruEntry {
-            kind,
-            id: id.to_string(),
-            workspace_id: workspace_id.to_string(),
-            focused_at: now,
-            name: name.or_else(|| old.as_ref().and_then(|o| o.name.clone())),
-            workspace_name: workspace_name
-                .or_else(|| old.as_ref().and_then(|o| o.workspace_name.clone())),
-        },
-    );
-
-    entries.truncate(300);
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    // Write to temp file then rename for atomicity.
-    // If the process crashes mid-write, the original file is untouched.
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, serde_json::to_string_pretty(&entries)?)?;
-    fs::rename(&tmp_path, &path)?;
-
+fn save_state(path: &Path, value: &impl Serialize) -> Result<()> {
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, serde_json::to_vec(value)?)?;
+    fs::rename(temp, path)?;
     Ok(())
-    // Lock released when `_lock` is dropped
 }
 
-/// Load all MRU entries from the persistent state file.
-pub fn load_mru() -> Vec<MruEntry> {
-    let state_path = mru_path();
-    let content = match std::fs::read_to_string(&state_path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    match serde_json::from_str(&content) {
-        Ok(entries) => entries,
-        Err(e) => {
-            // Corrupted file: back up and return empty vec to avoid silent data loss
-            log::error!("mru.json corrupted ({}), backing up to mru.json.bak", e);
-            let bak_path = state_path.with_extension("json.bak");
-            let _ = std::fs::rename(&state_path, &bak_path);
-            vec![]
+impl WorkingHistory {
+    pub fn is_empty(&self) -> bool {
+        self.periods.is_empty()
+    }
+
+    pub fn apply(&self, snapshot: &mut Snapshot, agents: &[AgentActivity]) {
+        let agents: HashMap<_, _> = agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
+        for pane in snapshot
+            .workspaces
+            .iter_mut()
+            .flat_map(|w| &mut w.tabs)
+            .flat_map(|t| &mut t.panes)
+        {
+            pane.working_since_ms = None;
+            let Some(period) = self.periods.get(&pane.id) else {
+                continue;
+            };
+            let Some(agent) = agents.get(pane.id.as_str()) else {
+                continue;
+            };
+            if pane.status == AgentStatus::Working
+                && agent.status == AgentStatus::Working
+                && agent.state_change_seq > 0
+                && period.sequence == agent.state_change_seq
+                && period.terminal_id == agent.terminal_id
+                && pane.terminal_id.as_deref() == Some(agent.terminal_id.as_str())
+                && Some(period.provider) == agent.provider()
+                && pane.agent.as_deref().and_then(AgentProvider::from_name) == Some(period.provider)
+                && period.provider.supports_timing()
+            {
+                pane.working_since_ms = Some(period.started_ms);
+            }
         }
     }
 }
 
-/// Build three separate timestamp maps (pane/tab/workspace) from MRU entries.
-/// Each map returns the **most recent** focus timestamp for that entity.
-///
-/// These maps are passed to builders directly so each category tab
-/// sorts using ONLY its own level's timestamps — no level mixing.
-pub fn build_timestamp_maps(
-    entries: &[MruEntry],
-) -> (
-    HashMap<String, u64>,
-    HashMap<String, u64>,
-    HashMap<String, u64>,
-) {
-    let mut pane_ts: HashMap<String, u64> = HashMap::new();
-    let mut tab_ts: HashMap<String, u64> = HashMap::new();
-    let mut ws_ts: HashMap<String, u64> = HashMap::new();
+impl WorkingTracker {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
 
-    for entry in entries {
-        let ts = entry.focused_at;
-        match entry.kind {
-            MruKind::Pane => {
-                pane_ts.entry(entry.id.clone()).or_insert(ts);
+    pub fn for_session() -> Self {
+        Self::new(session_path("working", "json"))
+    }
+
+    pub fn load(&self) -> Result<WorkingHistory> {
+        match fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("Invalid working-time history"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(WorkingHistory::default())
             }
-            MruKind::Tab => {
-                tab_ts.entry(entry.id.clone()).or_insert(ts);
-            }
-            MruKind::Workspace => {
-                ws_ts.entry(entry.id.clone()).or_insert(ts);
-            }
+            Err(error) => Err(error.into()),
         }
     }
 
-    (pane_ts, tab_ts, ws_ts)
+    pub fn record_event(
+        &self,
+        event: &serde_json::Value,
+        agents: &[AgentActivity],
+        timestamp: u64,
+    ) -> Result<()> {
+        let kind = event.get("event").and_then(|v| v.as_str());
+        if !matches!(
+            kind,
+            Some("pane_agent_status_changed" | "pane_closed" | "pane_exited")
+        ) {
+            return Ok(());
+        }
+        let data = &event["data"];
+        let pane_id = data["pane_id"]
+            .as_str()
+            .context("Working-time event is missing pane_id")?;
+        let current = if kind == Some("pane_agent_status_changed") {
+            let status: AgentStatus = serde_json::from_value(data["agent_status"].clone())?;
+            let current = agents.iter().find(|a| a.pane_id == pane_id);
+            match current {
+                Some(agent)
+                    if agent.status != status
+                        || agent.provider()
+                            != data["agent"].as_str().and_then(AgentProvider::from_name) =>
+                {
+                    return Ok(());
+                }
+                None if status == AgentStatus::Working => return Ok(()),
+                _ => current,
+            }
+        } else {
+            None
+        };
+        let _lock = lock_state(&self.path)?;
+        let mut saved = self.load()?;
+        let previous = saved.periods.get(pane_id);
+        if let (Some(previous), Some(current)) = (previous, current)
+            && previous.terminal_id == current.terminal_id
+            && previous.sequence > current.state_change_seq
+        {
+            return Ok(());
+        }
+        if let Some(agent) =
+            current.filter(|a| a.status == AgentStatus::Working && a.state_change_seq > 0)
+            && let Some(provider) = agent.provider().filter(|p| p.supports_timing())
+        {
+            if previous.is_some_and(|p| {
+                p.terminal_id == agent.terminal_id
+                    && p.sequence == agent.state_change_seq
+                    && p.provider == provider
+            }) {
+                return Ok(());
+            }
+            saved.periods.insert(
+                pane_id.into(),
+                WorkingPeriod {
+                    terminal_id: agent.terminal_id.clone(),
+                    provider,
+                    sequence: agent.state_change_seq,
+                    started_ms: timestamp,
+                },
+            );
+            if saved.periods.len() > 300 {
+                let oldest = saved
+                    .periods
+                    .iter()
+                    .min_by_key(|(_, p)| p.started_ms)
+                    .map(|(id, _)| id.clone())
+                    .unwrap();
+                saved.periods.remove(&oldest);
+            }
+        } else if saved.periods.remove(pane_id).is_none() {
+            return Ok(());
+        }
+        save_state(&self.path, &saved)
+    }
+}
+
+pub fn session_path(name: &str, extension: &str) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    std::env::var("HERDR_SOCKET_PATH")
+        .unwrap_or_default()
+        .hash(&mut hash);
+    let root = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/state")))
+                .unwrap_or_else(std::env::temp_dir)
+                .join("herdr-canopy")
+        });
+    root.join(format!("{name}-{:x}.{extension}", hash.finish()))
+}
+
+impl Tracker {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn for_session() -> Self {
+        Self::new(session_path("mru", "json"))
+    }
+
+    pub fn load(&self) -> Result<History> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StoredHistory {
+            Full(History),
+            Legacy(HashMap<String, u64>),
+        }
+        match fs::read_to_string(&self.path) {
+            Ok(data) => Ok(
+                match serde_json::from_str(&data).context("Invalid navigation history")? {
+                    StoredHistory::Full(history) => history,
+                    StoredHistory::Legacy(workspaces) => History {
+                        workspaces,
+                        ..History::default()
+                    },
+                },
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(History::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn record(&self, location: &ActiveLocation) -> Result<()> {
+        self.record_at(
+            location,
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
+        )
+    }
+
+    fn record_at(&self, location: &ActiveLocation, timestamp: u64) -> Result<()> {
+        let _lock = lock_state(&self.path)?;
+        let mut saved = self.load()?;
+        let timestamp = saved
+            .workspaces
+            .values()
+            .chain(saved.tabs.values())
+            .chain(saved.panes.values())
+            .max()
+            .map(|last| timestamp.max(last.saturating_add(1)))
+            .unwrap_or(timestamp);
+        for (map, id) in [
+            (&mut saved.workspaces, &location.workspace_id),
+            (&mut saved.tabs, &location.tab_id),
+            (&mut saved.panes, &location.pane_id),
+        ] {
+            if let Some(id) = id {
+                map.insert(id.clone(), timestamp);
+            }
+            if map.len() > 300 {
+                let mut entries: Vec<_> = map.iter().map(|(id, ts)| (id.clone(), *ts)).collect();
+                entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                *map = entries.into_iter().take(300).collect();
+            }
+        }
+        save_state(&self.path, &saved)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::with_temp_dir;
+    use crate::models::{AgentActivity, AgentStatus};
+    use serde_json::json;
 
-    // ── record_event tests ──
+    fn activity(sequence: u64, status: AgentStatus) -> AgentActivity {
+        AgentActivity {
+            pane_id: "named-notes".into(),
+            terminal_id: "term-notes".into(),
+            agent: Some("claude".into()),
+            status,
+            state_change_seq: sequence,
+        }
+    }
 
-    #[test]
-    fn test_record_event_creates_file() {
-        with_temp_dir(|dir| {
-            let path = dir.join("mru.json");
-            assert!(!path.exists(), "File should not exist before recording");
-            record_event(MruKind::Pane, "pane-1", "ws-1").unwrap();
-            assert!(path.exists(), "File should exist after recording");
-        });
+    fn work_event(agent: &AgentActivity) -> serde_json::Value {
+        json!({"event":"pane_agent_status_changed","data":{
+            "pane_id":agent.pane_id,"agent":agent.agent,"agent_status":agent.status
+        }})
+    }
+
+    fn known_start(tracker: &WorkingTracker, agent: &AgentActivity) -> Option<u64> {
+        let mut data = crate::test_helpers::snapshot();
+        let pane = &mut data.workspaces[0].tabs[0].panes[0];
+        pane.terminal_id = Some(agent.terminal_id.clone());
+        pane.agent.clone_from(&agent.agent);
+        pane.status = agent.status;
+        tracker
+            .load()
+            .unwrap()
+            .apply(&mut data, std::slice::from_ref(agent));
+        data.workspaces[0].tabs[0].panes[0].working_since_ms
     }
 
     #[test]
-    fn test_record_event_updates_timestamp() {
-        with_temp_dir(|_dir| {
-            record_event(MruKind::Pane, "pane-1", "ws-1").unwrap();
-            let entries = load_mru();
-            assert_eq!(entries.len(), 1);
-            let t1 = entries[0].focused_at;
-
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            record_event(MruKind::Pane, "pane-1", "ws-1").unwrap();
-            let entries = load_mru();
-            assert_eq!(entries.len(), 1, "Duplicate should not add new entry");
-            assert!(entries[0].focused_at > t1, "Timestamp should be updated");
-        });
-    }
-
-    #[test]
-    fn test_record_event_truncates_at_300() {
-        with_temp_dir(|_dir| {
-            for i in 0..301 {
-                record_event(MruKind::Pane, &format!("pane-{}", i), "ws-1").unwrap();
-            }
-            let entries = load_mru();
-            assert_eq!(entries.len(), 300, "Should truncate to 300 entries");
-            assert_eq!(entries[0].id, "pane-300", "Most recent should be first");
-        });
-    }
-
-    #[test]
-    fn test_record_event_preserves_name_on_update() {
-        with_temp_dir(|_dir| {
-            record_event_with_names(MruKind::Pane, "pane-1", "ws-1", Some("MyPane".into()), None)
-                .unwrap();
-
-            record_event_with_names(MruKind::Pane, "pane-1", "ws-1", None, None).unwrap();
-
-            let entries = load_mru();
-            assert_eq!(
-                entries[0].name.as_deref(),
-                Some("MyPane"),
-                "Name should be preserved from previous entry"
-            );
-        });
-    }
-
-    // ── load_mru tests ──
-
-    #[test]
-    fn test_load_mru_returns_empty_on_missing_file() {
-        with_temp_dir(|_dir| {
-            let entries = load_mru();
-            assert!(entries.is_empty(), "No file should return empty vec");
-        });
-    }
-
-    #[test]
-    fn test_load_mru_returns_empty_on_corrupt_file() {
-        with_temp_dir(|dir| {
-            let path = dir.join("mru.json");
-            std::fs::write(&path, "{{{corrupted data}}}").unwrap();
-            let entries = load_mru();
-            assert!(entries.is_empty(), "Corrupt file should return empty vec");
-            assert!(
-                path.with_extension("json.bak").exists(),
-                "Backup should be created for corrupt file"
-            );
-        });
-    }
-
-    #[test]
-    fn test_load_mru_reads_valid_entries() {
-        with_temp_dir(|dir| {
-            let path = dir.join("mru.json");
-            let data = r#"[
-                {"kind":"Pane","id":"pane-1","workspace_id":"ws-1","focused_at":1000}
-            ]"#;
-            std::fs::write(&path, data).unwrap();
-            let entries = load_mru();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].id, "pane-1");
-        });
-    }
-
-    // ── build_timestamp_maps tests ──
-
-    #[test]
-    fn test_build_timestamp_maps_separates_kinds() {
-        let entries = vec![
-            MruEntry {
-                kind: MruKind::Pane,
-                id: "same-id".into(),
-                workspace_id: "ws".into(),
-                focused_at: 100,
-                name: None,
-                workspace_name: None,
-            },
-            MruEntry {
-                kind: MruKind::Tab,
-                id: "same-id".into(),
-                workspace_id: "ws".into(),
-                focused_at: 200,
-                name: None,
-                workspace_name: None,
-            },
-            MruEntry {
-                kind: MruKind::Workspace,
-                id: "same-id".into(),
-                workspace_id: "ws".into(),
-                focused_at: 300,
-                name: None,
-                workspace_name: None,
-            },
-        ];
-        let (pane, tab, ws) = build_timestamp_maps(&entries);
-        assert_eq!(pane.get("same-id"), Some(&100));
-        assert_eq!(tab.get("same-id"), Some(&200));
-        assert_eq!(ws.get("same-id"), Some(&300));
-    }
-
-    #[test]
-    fn test_build_timestamp_maps_keeps_most_recent() {
-        // MRU order: most recent first (999 before 100)
-        let entries = vec![
-            MruEntry {
-                kind: MruKind::Pane,
-                id: "pane-1".into(),
-                workspace_id: "ws".into(),
-                focused_at: 999,
-                name: None,
-                workspace_name: None,
-            },
-            MruEntry {
-                kind: MruKind::Pane,
-                id: "pane-1".into(),
-                workspace_id: "ws".into(),
-                focused_at: 100,
-                name: None,
-                workspace_name: None,
-            },
-        ];
-        let (pane, _, _) = build_timestamp_maps(&entries);
+    fn work_start_survives_reopening_and_duplicate_working_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("working.json");
+        let tracker = WorkingTracker::new(path.clone());
+        let agent = activity(10, AgentStatus::Working);
+        assert_eq!(known_start(&tracker, &agent), None);
+        tracker
+            .record_event(&work_event(&agent), std::slice::from_ref(&agent), 10_000)
+            .unwrap();
+        WorkingTracker::new(path.clone())
+            .record_event(&work_event(&agent), std::slice::from_ref(&agent), 20_000)
+            .unwrap();
         assert_eq!(
-            pane.get("pane-1"),
-            Some(&999),
-            "Should keep most recent (first seen in MRU order)"
+            known_start(&WorkingTracker::new(path), &agent),
+            Some(10_000)
         );
     }
 
-    // ── atomic write test ──
+    #[test]
+    fn nonworking_states_clear_the_timer_and_a_new_working_period_resets_it() {
+        for status in [
+            AgentStatus::Idle,
+            AgentStatus::Done,
+            AgentStatus::Blocked,
+            AgentStatus::Unknown,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let tracker = WorkingTracker::new(dir.path().join("working.json"));
+            let mut agent = activity(10, AgentStatus::Working);
+            tracker
+                .record_event(&work_event(&agent), std::slice::from_ref(&agent), 10_000)
+                .unwrap();
+            agent.status = status;
+            agent.state_change_seq = 11;
+            tracker
+                .record_event(&work_event(&agent), std::slice::from_ref(&agent), 20_000)
+                .unwrap();
+            assert_eq!(known_start(&tracker, &agent), None);
+            agent.status = AgentStatus::Working;
+            agent.state_change_seq = 12;
+            tracker
+                .record_event(&work_event(&agent), std::slice::from_ref(&agent), 30_000)
+                .unwrap();
+            assert_eq!(known_start(&tracker, &agent), Some(30_000));
+        }
+    }
 
     #[test]
-    fn test_record_event_atomic_write_survives_crash() {
-        with_temp_dir(|dir| {
-            record_event(MruKind::Pane, "pane-1", "ws-1").unwrap();
-            let path = dir.join("mru.json");
-            let content_before = std::fs::read_to_string(&path).unwrap();
+    fn old_work_records_cannot_time_a_new_terminal_provider_or_working_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = WorkingTracker::new(dir.path().join("working.json"));
+        let agent = activity(10, AgentStatus::Working);
+        tracker
+            .record_event(&work_event(&agent), std::slice::from_ref(&agent), 10_000)
+            .unwrap();
+        for changed in [
+            AgentActivity {
+                terminal_id: "replacement".into(),
+                ..agent.clone()
+            },
+            AgentActivity {
+                state_change_seq: 11,
+                ..agent.clone()
+            },
+            AgentActivity {
+                agent: Some("codex".into()),
+                ..agent.clone()
+            },
+            AgentActivity {
+                status: AgentStatus::Idle,
+                ..agent.clone()
+            },
+        ] {
+            assert_eq!(known_start(&tracker, &changed), None);
+        }
+        let stale = activity(9, AgentStatus::Idle);
+        tracker
+            .record_event(&work_event(&stale), std::slice::from_ref(&agent), 20_000)
+            .unwrap();
+        assert_eq!(known_start(&tracker, &agent), Some(10_000));
+    }
 
-            // Simulate partial write: tmp file exists but rename never happened
-            let tmp_path = path.with_extension("json.tmp");
-            std::fs::write(&tmp_path, "{{{partial}}}").unwrap();
-            // Don't rename — simulates crash
+    #[test]
+    fn unsupported_agents_and_missing_transition_ids_do_not_get_timers() {
+        for agent in [
+            AgentActivity {
+                agent: Some("other".into()),
+                ..activity(10, AgentStatus::Working)
+            },
+            AgentActivity {
+                agent: None,
+                ..activity(10, AgentStatus::Working)
+            },
+            activity(0, AgentStatus::Working),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let tracker = WorkingTracker::new(dir.path().join("working.json"));
+            tracker
+                .record_event(&work_event(&agent), std::slice::from_ref(&agent), 10_000)
+                .unwrap();
+            assert_eq!(known_start(&tracker, &agent), None);
+        }
+    }
 
-            let content_after = std::fs::read_to_string(&path).unwrap();
-            assert_eq!(
-                content_before, content_after,
-                "Crash during write should not corrupt original file"
-            );
+    #[test]
+    fn closed_or_exited_panes_lose_their_timer() {
+        for event in ["pane_closed", "pane_exited"] {
+            let dir = tempfile::tempdir().unwrap();
+            let tracker = WorkingTracker::new(dir.path().join("working.json"));
+            let agent = activity(10, AgentStatus::Working);
+            tracker
+                .record_event(&work_event(&agent), std::slice::from_ref(&agent), 10_000)
+                .unwrap();
+            tracker
+                .record_event(
+                    &json!({"event":event,"data":{"pane_id":agent.pane_id}}),
+                    &[],
+                    20_000,
+                )
+                .unwrap();
+            assert_eq!(known_start(&tracker, &agent), None);
+        }
+    }
+
+    #[test]
+    fn working_history_rejects_inconsistent_pane_snapshots_and_missing_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = WorkingTracker::new(dir.path().join("working.json"));
+        let agent = activity(10, AgentStatus::Working);
+        tracker
+            .record_event(&work_event(&agent), std::slice::from_ref(&agent), 10_000)
+            .unwrap();
+        for mismatch in 0..4 {
+            let mut data = crate::test_helpers::snapshot();
+            let pane = &mut data.workspaces[0].tabs[0].panes[0];
+            pane.terminal_id = Some(agent.terminal_id.clone());
+            match mismatch {
+                0 => pane.terminal_id = Some("replacement".into()),
+                1 => pane.status = AgentStatus::Idle,
+                2 => pane.agent = Some("codex".into()),
+                _ => {}
+            }
+            let agents = if mismatch == 3 {
+                &[][..]
+            } else {
+                std::slice::from_ref(&agent)
+            };
+            tracker.load().unwrap().apply(&mut data, agents);
+            assert_eq!(data.workspaces[0].tabs[0].panes[0].working_since_ms, None);
+        }
+    }
+
+    #[test]
+    fn codex_work_events_are_supported_and_unrelated_or_malformed_events_do_not_overwrite_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = WorkingTracker::new(dir.path().join("working.json"));
+        let mut agent = activity(10, AgentStatus::Working);
+        agent.agent = Some("codex".into());
+        tracker
+            .record_event(&work_event(&agent), std::slice::from_ref(&agent), 10_000)
+            .unwrap();
+        tracker
+            .record_event(&json!({"event":"unrelated"}), &[], 20_000)
+            .unwrap();
+        let mut wrong_provider = work_event(&agent);
+        wrong_provider["data"]["agent"] = json!("claude");
+        tracker
+            .record_event(&wrong_provider, std::slice::from_ref(&agent), 20_000)
+            .unwrap();
+        assert!(
+            tracker
+                .record_event(
+                    &json!({"event":"pane_agent_status_changed","data":{}}),
+                    &[],
+                    20_000
+                )
+                .is_err()
+        );
+        assert_eq!(known_start(&tracker, &agent), Some(10_000));
+    }
+
+    #[test]
+    fn concurrent_work_events_preserve_all_panes_and_corrupt_state_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("working.json");
+        std::thread::scope(|s| {
+            for n in 0..10 {
+                let path = path.clone();
+                s.spawn(move || {
+                    let mut agent = activity(10, AgentStatus::Working);
+                    agent.pane_id = format!("pane-{n}");
+                    WorkingTracker::new(path)
+                        .record_event(&work_event(&agent), &[agent], 10_000)
+                        .unwrap();
+                });
+            }
         });
+        assert_eq!(
+            WorkingTracker::new(path.clone())
+                .load()
+                .unwrap()
+                .periods
+                .len(),
+            10
+        );
+        fs::write(&path, "invalid").unwrap();
+        let agent = activity(10, AgentStatus::Working);
+        assert!(
+            WorkingTracker::new(path.clone())
+                .record_event(&work_event(&agent), &[agent], 20_000)
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), "invalid");
+    }
+
+    fn workspace(id: &str) -> ActiveLocation {
+        ActiveLocation {
+            workspace_id: Some(id.into()),
+            ..ActiveLocation::default()
+        }
+    }
+
+    #[test]
+    fn legacy_workspace_history_is_preserved_when_tab_and_pane_history_are_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mru.json");
+        std::fs::write(&path, r#"{"old-workspace":10}"#).unwrap();
+        let tracker = Tracker::new(path);
+        tracker
+            .record_at(
+                &ActiveLocation {
+                    workspace_id: Some("new-workspace".into()),
+                    tab_id: Some("tab".into()),
+                    pane_id: Some("pane".into()),
+                },
+                20,
+            )
+            .unwrap();
+        let history = tracker.load().unwrap();
+        assert_eq!(history.workspaces.get("old-workspace"), Some(&10));
+        assert_eq!(history.workspaces.get("new-workspace"), Some(&20));
+        assert_eq!(history.tabs.get("tab"), Some(&20));
+        assert_eq!(history.panes.get("pane"), Some(&20));
+    }
+
+    #[test]
+    fn rapid_focus_changes_have_a_total_order_across_location_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = Tracker::new(dir.path().join("mru.json"));
+        tracker
+            .record_at(
+                &ActiveLocation {
+                    workspace_id: Some("w".into()),
+                    tab_id: Some("t1".into()),
+                    pane_id: Some("p1".into()),
+                },
+                10,
+            )
+            .unwrap();
+        tracker
+            .record_at(
+                &ActiveLocation {
+                    workspace_id: Some("w".into()),
+                    tab_id: Some("t2".into()),
+                    pane_id: Some("p2".into()),
+                },
+                10,
+            )
+            .unwrap();
+        let history = tracker.load().unwrap();
+        assert!(history.panes["p2"] > history.panes["p1"]);
+        assert_eq!(history.tabs["t2"], history.panes["p2"]);
+        assert_eq!(history.workspaces["w"], history.panes["p2"]);
+    }
+
+    #[test]
+    fn recording_updates_recency_and_keeps_other_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = Tracker::new(dir.path().join("mru.json"));
+        tracker.record_at(&workspace("a"), 10).unwrap();
+        tracker.record_at(&workspace("b"), 20).unwrap();
+        tracker.record_at(&workspace("a"), 30).unwrap();
+        assert_eq!(
+            tracker.load().unwrap().workspaces,
+            HashMap::from([("a".into(), 30), ("b".into(), 20)])
+        );
+    }
+
+    #[test]
+    fn corrupt_state_is_preserved_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mru.json");
+        std::fs::write(&path, "corrupt").unwrap();
+        let tracker = Tracker::new(path.clone());
+        assert!(tracker.record_at(&workspace("a"), 10).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "corrupt");
+    }
+
+    #[test]
+    fn concurrent_records_do_not_lose_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mru.json");
+        std::thread::scope(|s| {
+            for n in 0..10 {
+                let path = path.clone();
+                s.spawn(move || {
+                    Tracker::new(path)
+                        .record_at(&workspace(&format!("w{n}")), n)
+                        .unwrap()
+                });
+            }
+        });
+        assert_eq!(Tracker::new(path).load().unwrap().workspaces.len(), 10);
+    }
+
+    #[test]
+    fn bounded_history_retains_most_recent_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = Tracker::new(dir.path().join("mru.json"));
+        for n in 0..305 {
+            tracker.record_at(&workspace(&format!("w{n}")), n).unwrap();
+        }
+        let saved = tracker.load().unwrap().workspaces;
+        assert_eq!(saved.len(), 300);
+        assert!(!saved.contains_key("w0"));
+        assert_eq!(saved.get("w304"), Some(&304));
     }
 }

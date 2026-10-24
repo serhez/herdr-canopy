@@ -1,842 +1,412 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::rc::Rc;
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-/// The status of an AI agent within a pane.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActiveLocation {
+    pub workspace_id: Option<String>,
+    pub tab_id: Option<String>,
+    pub pane_id: Option<String>,
+}
+
+impl ActiveLocation {
+    pub fn complete_from(&mut self, other: &Self) {
+        if [
+            (&self.workspace_id, &other.workspace_id),
+            (&self.tab_id, &other.tab_id),
+            (&self.pane_id, &other.pane_id),
+        ]
+        .iter()
+        .any(|(a, b)| a.is_some() && a != b)
+        {
+            return;
+        }
+        if self.workspace_id.is_none() {
+            self.workspace_id.clone_from(&other.workspace_id);
+        }
+        if self.tab_id.is_none() {
+            self.tab_id.clone_from(&other.tab_id);
+        }
+        if self.pane_id.is_none() {
+            self.pane_id.clone_from(&other.pane_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct History {
+    pub workspaces: HashMap<String, u64>,
+    pub tabs: HashMap<String, u64>,
+    pub panes: HashMap<String, u64>,
+}
+
+impl History {
+    pub fn timestamp(&self, target: &FocusTarget) -> u64 {
+        let (map, id) = match target {
+            FocusTarget::Workspace(id) => (&self.workspaces, id),
+            FocusTarget::Tab(id) => (&self.tabs, id),
+            FocusTarget::Pane(id) => (&self.panes, id),
+        };
+        map.get(id).copied().unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub workspaces: Vec<Workspace>,
+}
+
+impl Snapshot {
+    pub fn active_location(&self, context: Option<&serde_json::Value>) -> ActiveLocation {
+        let mut location = ActiveLocation::default();
+        if let Some(value) = context {
+            let field = |a: &str, b: &str| {
+                value
+                    .get(a)
+                    .or_else(|| value.get(b))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            };
+            location = ActiveLocation {
+                workspace_id: field("workspace_id", "focused_workspace_id"),
+                tab_id: field("tab_id", "focused_tab_id"),
+                pane_id: field("focused_pane_id", "pane_id"),
+            };
+        }
+        if let Some(pane) = self
+            .workspaces
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .flat_map(|t| &t.panes)
+            .find(|p| location.pane_id.as_ref() == Some(&p.id))
+        {
+            location
+                .workspace_id
+                .get_or_insert_with(|| pane.workspace_id.clone());
+            location.tab_id.get_or_insert_with(|| pane.tab_id.clone());
+        }
+        if location == ActiveLocation::default() {
+            if let Some(pane) = self
+                .workspaces
+                .iter()
+                .flat_map(|w| &w.tabs)
+                .flat_map(|t| &t.panes)
+                .find(|p| p.focused)
+            {
+                location = ActiveLocation {
+                    workspace_id: Some(pane.workspace_id.clone()),
+                    tab_id: Some(pane.tab_id.clone()),
+                    pane_id: Some(pane.id.clone()),
+                };
+            } else if let Some(workspace) = self.workspaces.iter().find(|w| w.focused) {
+                location.workspace_id = Some(workspace.id.clone());
+                location.tab_id.clone_from(&workspace.active_tab_id);
+            }
+        }
+        location
+    }
+
+    pub fn exclude_pane(&mut self, pane_id: &str) {
+        for workspace in &mut self.workspaces {
+            for tab in &mut workspace.tabs {
+                tab.panes.retain(|pane| pane.id != pane_id);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Workspace {
+    #[serde(rename = "workspace_id")]
+    pub id: String,
+    #[serde(rename = "label")]
+    pub name: String,
+    #[serde(default)]
+    pub focused: bool,
+    pub active_tab_id: Option<String>,
+    pub worktree: Option<Worktree>,
+    #[serde(skip)]
+    pub tabs: Vec<Tab>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Worktree {
+    pub is_linked_worktree: bool,
+    pub repo_key: String,
+    pub repo_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Tab {
+    #[serde(rename = "tab_id")]
+    pub id: String,
+    pub workspace_id: String,
+    #[serde(rename = "label", default)]
+    pub name: String,
+    #[serde(skip)]
+    pub panes: Vec<Pane>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Pane {
+    #[serde(rename = "pane_id")]
+    pub id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(rename = "label")]
+    pub name: Option<String>,
+    pub terminal_title_stripped: Option<String>,
+    pub terminal_title: Option<String>,
+    pub agent: Option<String>,
+    pub terminal_id: Option<String>,
+    #[serde(skip)]
+    pub working_since_ms: Option<u64>,
+    #[serde(rename = "agent_status", default)]
+    pub status: AgentStatus,
+}
+
+impl Pane {
+    pub fn display_name(&self) -> Option<String> {
+        if let Some(label) = self.name.as_ref().filter(|name| !name.trim().is_empty()) {
+            return Some(label.clone());
+        }
+        let provider = self.agent.as_deref().and_then(AgentProvider::from_name)?;
+        if let Some(title) = self
+            .terminal_title_stripped
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| {
+                self.terminal_title
+                    .as_deref()
+                    .filter(|title| !title.trim().is_empty())
+            })
+        {
+            return Some(title.trim().to_owned());
+        }
+        let name = match provider {
+            AgentProvider::Codex => "Codex",
+            AgentProvider::Claude => "Claude",
+            AgentProvider::Other => self.agent.as_deref()?.trim(),
+        };
+        Some(format!("{name} ({})", self.id))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProvider {
+    Codex,
+    Claude,
+    Other,
+}
+
+impl AgentProvider {
+    pub fn supports_timing(self) -> bool {
+        matches!(self, Self::Codex | Self::Claude)
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        let name = name.trim();
+        if name.is_empty() {
+            None
+        } else if name.eq_ignore_ascii_case("codex") {
+            Some(Self::Codex)
+        } else if name.eq_ignore_ascii_case("claude") {
+            Some(Self::Claude)
+        } else {
+            Some(Self::Other)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
-    Working,
     Blocked,
+    Working,
     Done,
     Idle,
-    /// Normal pane, no running AI agent.
-    None,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentActivity {
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub agent: Option<String>,
+    #[serde(rename = "agent_status")]
+    pub status: AgentStatus,
+    #[serde(default)]
+    pub state_change_seq: u64,
+}
+
+impl AgentActivity {
+    pub fn provider(&self) -> Option<AgentProvider> {
+        self.agent.as_deref().and_then(AgentProvider::from_name)
+    }
 }
 
 impl AgentStatus {
-    /// Returns true if the agent is actively doing work (Working status).
-    /// Currently unused after ActiveOnly filter removal; kept for future use.
-    #[allow(dead_code)]
-    pub fn is_active(&self) -> bool {
-        matches!(self, AgentStatus::Working)
-    }
-}
-
-/// Separates a linked worktree's repo/main-workspace label from its own label.
-pub const WORKTREE_SEP: &str = " ⎇ ";
-
-/// A composite navigation node representing a pane with its workspace/tab/agent context.
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct NavigationNode {
-    pub workspace_id: String,
-    pub workspace_name: String,
-    pub tab_id: String,
-    pub tab_name: String,
-    pub pane_id: String,
-    pub pane_name: Option<String>,
-    pub agent_id: Option<String>,
-    pub agent_status: AgentStatus,
-    /// Millisecond timestamp for MRU sorting.
-    pub last_accessed_at: u64,
-}
-
-/// The source kind of an "All" row: which runtime state dimension a pane
-/// record represents. Not identity — `cmd`/`ssh`/`cwd`/`file` describe what
-/// the pane is doing/where it is/what it shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OtherSource {
-    /// Among the running foreground command (detail = the command line).
-    Cmd,
-    /// Active ssh/mosh login target (detail = `user@host` or `host:port`).
-    Ssh,
-    /// Terminal/command-output buffer match (detail = a one-line excerpt
-    /// around the hit). The pane is NOT editing a file.
-    Terminal,
-    /// Editor buffer match (detail = a one-line excerpt around the hit).
-    /// The pane's foreground is an editor, so the excerpt is file content.
-    File,
-    /// The pane's current directory.
-    Cwd,
-}
-
-impl OtherSource {
-    /// All variants, in display-priority order.
-    pub const ALL: [OtherSource; 5] = [
-        OtherSource::Ssh,
-        OtherSource::Cmd,
-        OtherSource::Terminal,
-        OtherSource::File,
-        OtherSource::Cwd,
-    ];
-
-    /// Short label shown in the Type column / searchable text.
-    pub fn label(&self) -> &'static str {
+    pub fn priority(self) -> u8 {
         match self {
-            OtherSource::Cmd => "cmd",
-            OtherSource::Ssh => "ssh",
-            OtherSource::Terminal => "term",
-            OtherSource::File => "file",
-            OtherSource::Cwd => "cwd",
-        }
-    }
-
-    /// Ordering priority within a pane's records (lower sorts first).
-    pub fn priority(&self) -> u8 {
-        match self {
-            OtherSource::Ssh => 0,
-            OtherSource::Cmd => 1,
-            OtherSource::Terminal => 2,
-            OtherSource::File => 3,
-            OtherSource::Cwd => 4,
+            AgentStatus::Blocked => 4,
+            AgentStatus::Working => 3,
+            AgentStatus::Done => 2,
+            AgentStatus::Idle => 1,
+            AgentStatus::Unknown => 0,
         }
     }
 }
 
-/// A narrowed-search filter for the All tab, parsed off the query prefix
-/// and shown as a badge next to the input (`cmd `, `ws `, `.`, …).
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum OthersFilter {
-    /// Leading `.` — buffer content rows only (file + term).
-    Content,
-    /// `<label> ` prefix — rows of that source only.
-    Source(OtherSource),
-    /// Leading `ws ` — the workspace list, filtered by the remaining text.
-    Workspace,
-    /// Leading `tab ` — the tab list, filtered by the remaining text.
-    Tab,
-    /// Leading `pane ` — the pane list, filtered by the remaining text.
-    Pane,
-}
-
-impl OthersFilter {
-    /// Split a leading filter off `query`, returning it with the remaining
-    /// text. A filter activates only when its exact label is followed by a
-    /// space (`cmd `, `ssh `, `cwd `, `file `, `term `, `ws `, `tab `,
-    /// `pane `) — a bare label stays ordinary search text.
-    pub fn parse(query: &str) -> (Option<Self>, &str) {
-        let (base, rest) = match query.strip_prefix('.') {
-            Some(r) => (Some(OthersFilter::Content), r),
-            None => (None, query),
-        };
-        for src in OtherSource::ALL {
-            if let Some(tail) = rest.strip_prefix(src.label())
-                && let Some(needle) = tail.strip_prefix(' ')
-            {
-                return (Some(OthersFilter::Source(src)), needle);
-            }
-        }
-        for (label, f) in [
-            ("ws", OthersFilter::Workspace),
-            ("tab", OthersFilter::Tab),
-            ("pane", OthersFilter::Pane),
-        ] {
-            if let Some(tail) = rest.strip_prefix(label)
-                && let Some(needle) = tail.strip_prefix(' ')
-            {
-                return (Some(f), needle);
-            }
-        }
-        (base, rest)
-    }
-
-    /// Short label shown in the badge next to the input.
-    pub fn label(&self) -> &'static str {
-        match self {
-            OthersFilter::Content => "content",
-            OthersFilter::Source(src) => src.label(),
-            OthersFilter::Workspace => "ws",
-            OthersFilter::Tab => "tab",
-            OthersFilter::Pane => "pane",
-        }
-    }
-}
-
-/// Lazily-fetched runtime state for a pane, used by the All tab.
-/// Unlike `NavigationNode` (refreshed every 2s), this is refetched only while
-/// the All tab is active, and only once per pane per refresh window.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PaneOthers {
-    pub cwd: Option<String>,
-    pub command: Option<String>,
-    pub ssh_target: Option<String>,
-}
-
-/// The category tabs at the top of the navigator UI.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum CategoryTab {
-    Workspaces,
-    Tabs,
-    Agents,
-    Panes,
-    /// Unified search across everything: pane state (cmd / ssh / cwd) and
-    /// pane-buffer content in one list; a leading `.` narrows to buffer
-    /// content only, `ws `/`tab `/`pane ` swap to that dimension's list.
-    /// Excludes agent panes.
-    All,
-}
-
-impl CategoryTab {
-    /// Number of variants, for cycling.
-    pub const COUNT: usize = 5;
-
-    /// Return all variants in the default order.
-    pub fn all() -> [CategoryTab; Self::COUNT] {
-        [
-            CategoryTab::Workspaces,
-            CategoryTab::Tabs,
-            CategoryTab::Panes,
-            CategoryTab::Agents,
-            CategoryTab::All,
-        ]
-    }
-
-    /// Display label for the tab.
-    pub fn label(&self) -> &'static str {
-        match self {
-            CategoryTab::Workspaces => "Workspaces",
-            CategoryTab::Tabs => "Tabs",
-            CategoryTab::Agents => "Agents",
-            CategoryTab::Panes => "Panes",
-            CategoryTab::All => "All",
-        }
-    }
-}
-
-/// Parse the configured tab list. The array carries both order and
-/// visibility: position is display order, membership is shown-at-all.
-/// Unknown labels are ignored and duplicates deduped (first wins); an empty
-/// or all-invalid list degrades to `["all"]` — the navigator must always
-/// show at least one tab.
-pub fn parse_tabs(spec: &[String]) -> Vec<CategoryTab> {
-    let mut tabs: Vec<CategoryTab> = Vec::new();
-    for s in spec {
-        if let Ok(t) = s.trim().parse::<CategoryTab>()
-            && !tabs.contains(&t)
-        {
-            tabs.push(t);
-        }
-    }
-    if tabs.is_empty() {
-        vec![CategoryTab::All]
-    } else {
-        tabs
-    }
-}
-
-/// A display item representing one row in the category-specific list.
-/// Each variant carries only the fields relevant to its tab's rendering.
-#[derive(Debug, Clone)]
-pub enum DisplayItem {
-    Workspace {
-        name: String,
-        id: String,
-        pane_ids: Vec<String>,
-        agent_statuses: Vec<AgentStatus>,
-        last_accessed_at: u64,
-    },
-    Tab {
-        name: String,
-        workspace: String,
-        tab_id: String,
-        pane_ids: Vec<String>,
-        agent_statuses: Vec<AgentStatus>,
-        last_accessed_at: u64,
-    },
-    Agent {
-        agent_id: String,
-        status: AgentStatus,
-        pane_id: String,
-        tab: String,
-        workspace: String,
-        last_accessed_at: u64,
-    },
-    Pane {
-        pane_id: String,
-        pane_name: String,
-        tab: String,
-        workspace: String,
-        agent_id: Option<String>,
-        status: AgentStatus,
-        last_accessed_at: u64,
-    },
-    Other {
-        pane_id: String,
-        pane_name: String,
-        tab: String,
-        workspace: String,
-        source: OtherSource,
-        /// The matched/runtime value: command line, ssh target, cwd path,
-        /// or a content-search excerpt.
-        detail: String,
-        /// Where the record lives, shown in the Context column: the edited
-        /// file path (`file`), the pane's cwd (`cmd`), the connected host
-        /// (`ssh`), or `-` when not applicable (`cwd`/`term`).
-        context: String,
-        last_accessed_at: u64,
-    },
-}
-
-impl DisplayItem {
-    /// Deterministic secondary sort key for stable ordering when timestamps tie.
-    pub fn sort_key(&self) -> String {
-        match self {
-            DisplayItem::Workspace { name, .. } => name.clone(),
-            DisplayItem::Tab {
-                name, workspace, ..
-            } => format!("{}:{}", workspace, name),
-            DisplayItem::Agent { agent_id, .. } => agent_id.clone(),
-            DisplayItem::Pane { pane_name, .. } => pane_name.clone(),
-            DisplayItem::Other {
-                pane_name, source, ..
-            } => format!("{}{}", source.priority(), pane_name),
-        }
-    }
-
-    /// Build the searchable text for this item, used for fuzzy matching.
-    pub fn search_text(&self) -> String {
-        match self {
-            DisplayItem::Workspace { name, .. } => name.clone(),
-            DisplayItem::Tab {
-                name, workspace, ..
-            } => format!("{} {}", name, workspace),
-            DisplayItem::Agent {
-                agent_id,
-                tab,
-                workspace,
-                ..
-            } => format!("{} {} {}", agent_id, tab, workspace),
-            DisplayItem::Pane {
-                pane_name,
-                tab,
-                workspace,
-                agent_id,
-                ..
-            } => {
-                format!(
-                    "{} {} {} {}",
-                    pane_name,
-                    tab,
-                    workspace,
-                    agent_id.as_deref().unwrap_or("")
-                )
-            }
-            DisplayItem::Other {
-                pane_name,
-                tab,
-                workspace,
-                source,
-                detail,
-                ..
-            } => {
-                format!(
-                    "{} {} {} {} {}",
-                    source.label(),
-                    detail,
-                    pane_name,
-                    tab,
-                    workspace
-                )
-            }
-        }
-    }
-}
-
-/// What entity to focus when the user selects an item and exits.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FocusTarget {
     Workspace(String),
     Tab(String),
     Pane(String),
 }
 
-/// Result of a key event handling.
-#[derive(Debug, PartialEq, Eq)]
-pub enum KeyAction {
-    /// Continue the event loop.
-    Continue,
-    /// Exit without focusing any workspace (Esc dismiss).
-    ExitDismiss,
-    /// Exit and focus the selected workspace (Enter / number keys).
-    ExitSelect,
-}
-
-/// A parsed key combination like `C-S-n` (Ctrl+Shift+n) or `Tab`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyBinding {
-    pub code: KeyCode,
-    pub modifiers: KeyModifiers,
-}
-
-impl std::str::FromStr for KeyBinding {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut modifiers = KeyModifiers::NONE;
-        let mut rest = s;
-
-        loop {
-            if let Some(tail) = rest.strip_prefix("C-") {
-                modifiers |= KeyModifiers::CONTROL;
-                rest = tail;
-            } else if let Some(tail) = rest.strip_prefix("S-") {
-                modifiers |= KeyModifiers::SHIFT;
-                rest = tail;
-            } else if let Some(tail) = rest.strip_prefix("M-").or_else(|| rest.strip_prefix("A-")) {
-                modifiers |= KeyModifiers::ALT;
-                rest = tail;
-            } else {
-                break;
-            }
+impl FocusTarget {
+    pub fn key(&self) -> String {
+        match self {
+            Self::Workspace(id) => format!("workspace:{id}"),
+            Self::Tab(id) => format!("tab:{id}"),
+            Self::Pane(id) => format!("pane:{id}"),
         }
-
-        let code = match rest {
-            "Tab" => {
-                if modifiers.contains(KeyModifiers::SHIFT) {
-                    // Shift+Tab produces BackTab in crossterm
-                    KeyCode::BackTab
-                } else {
-                    KeyCode::Tab
-                }
-            }
-            "BackTab" => KeyCode::BackTab,
-            "Up" => KeyCode::Up,
-            "Down" => KeyCode::Down,
-            "Enter" => KeyCode::Enter,
-            "Esc" => KeyCode::Esc,
-            "Backspace" => KeyCode::Backspace,
-            "Space" => KeyCode::Char(' '),
-            c if c.len() == 1 => KeyCode::Char(c.chars().next().unwrap()),
-            _ => return Err(format!("Unknown key: {s}")),
-        };
-
-        Ok(KeyBinding { code, modifiers })
     }
 }
 
-/// Logical actions that can be bound to keys.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
-    NextCategory,
-    PreviousCategory,
-    MoveUp,
-    MoveDown,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAction {
+    Continue,
     Select,
     Dismiss,
-    ForceQuit,
-    Backspace,
 }
 
-/// Configurable keybinding map. Each action accepts multiple key strings.
-/// Parsed from `[keybindings]` section in `herdr-plugin.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Keybindings {
-    #[serde(default = "default_next_category")]
-    pub next_category: Vec<String>,
-    #[serde(default = "default_previous_category")]
-    pub previous_category: Vec<String>,
-    #[serde(default = "default_move_up")]
+    pub toggle_all: Vec<String>,
     pub move_up: Vec<String>,
-    #[serde(default = "default_move_down")]
     pub move_down: Vec<String>,
-    #[serde(default = "default_select")]
+    pub expand: Vec<String>,
+    pub collapse: Vec<String>,
     pub select: Vec<String>,
-    #[serde(default = "default_dismiss")]
     pub dismiss: Vec<String>,
-    #[serde(default = "default_force_quit")]
     pub force_quit: Vec<String>,
-    #[serde(default = "default_backspace")]
     pub backspace: Vec<String>,
-}
-
-fn default_next_category() -> Vec<String> {
-    vec!["Tab".into()]
-}
-fn default_previous_category() -> Vec<String> {
-    vec!["S-Tab".into()]
-}
-fn default_move_up() -> Vec<String> {
-    vec!["Up".into(), "C-p".into()]
-}
-fn default_move_down() -> Vec<String> {
-    vec!["Down".into(), "C-n".into()]
-}
-fn default_select() -> Vec<String> {
-    vec!["Enter".into()]
-}
-fn default_dismiss() -> Vec<String> {
-    vec!["Esc".into()]
-}
-fn default_force_quit() -> Vec<String> {
-    vec!["C-c".into()]
-}
-fn default_backspace() -> Vec<String> {
-    vec!["Backspace".into()]
 }
 
 impl Default for Keybindings {
     fn default() -> Self {
+        fn keys(values: &[&str]) -> Vec<String> {
+            values.iter().map(|s| (*s).into()).collect()
+        }
         Self {
-            next_category: default_next_category(),
-            previous_category: default_previous_category(),
-            move_up: default_move_up(),
-            move_down: default_move_down(),
-            select: default_select(),
-            dismiss: default_dismiss(),
-            force_quit: default_force_quit(),
-            backspace: default_backspace(),
+            toggle_all: keys(&["Tab"]),
+            move_up: keys(&["Up", "C-p"]),
+            move_down: keys(&["Down", "C-n"]),
+            expand: keys(&["Right"]),
+            collapse: keys(&["Left"]),
+            select: keys(&["Enter"]),
+            dismiss: keys(&["Esc"]),
+            force_quit: keys(&["C-c"]),
+            backspace: keys(&["Backspace"]),
         }
     }
 }
 
 impl Keybindings {
-    /// Return the action triggered by a given key event, or `None` if no binding matches.
-    pub fn action_for(&self, key: &KeyEvent) -> Option<Action> {
-        let binding = KeyBinding {
-            code: key.code,
-            modifiers: key.modifiers,
+    pub fn matches(bindings: &[String], event: KeyEvent) -> bool {
+        bindings.iter().any(|binding| {
+            parse_key(binding).is_some_and(|parsed| {
+                parsed.code == event.code && parsed.modifiers == event.modifiers
+            })
+        })
+    }
+}
+
+fn parse_key(text: &str) -> Option<KeyEvent> {
+    let mut rest = text;
+    let mut modifiers = KeyModifiers::NONE;
+    loop {
+        let Some((prefix, modifier)) = [
+            ("C-", KeyModifiers::CONTROL),
+            ("S-", KeyModifiers::SHIFT),
+            ("M-", KeyModifiers::ALT),
+            ("A-", KeyModifiers::ALT),
+        ]
+        .into_iter()
+        .find(|(prefix, _)| rest.starts_with(prefix)) else {
+            break;
         };
-        macro_rules! check {
-            ($field:ident, $action:expr) => {
-                if self
-                    .$field
-                    .iter()
-                    .any(|s| s.parse::<KeyBinding>().ok().as_ref() == Some(&binding))
-                {
-                    return Some($action);
-                }
-            };
-        }
-        check!(next_category, Action::NextCategory);
-        check!(previous_category, Action::PreviousCategory);
-        check!(move_up, Action::MoveUp);
-        check!(move_down, Action::MoveDown);
-        check!(select, Action::Select);
-        check!(dismiss, Action::Dismiss);
-        check!(force_quit, Action::ForceQuit);
-        check!(backspace, Action::Backspace);
-        None
-    }
-}
-
-/// Global TUI application state.
-pub struct AppState {
-    /// Configurable keybindings.
-    pub keybindings: Keybindings,
-    /// Full list of navigation nodes.
-    pub nodes: Vec<NavigationNode>,
-    /// Currently selected category tab.
-    pub current_category: CategoryTab,
-    /// Configured category tabs — display order and visibility combined
-    /// (parsed from `[navigator] tabs`). Always non-empty.
-    pub tabs: Vec<CategoryTab>,
-    /// Search input text.
-    pub search_query: String,
-    /// Currently highlighted list index.
-    pub selected_index: usize,
-    /// Animation tick for spinner (incremented each render frame).
-    pub spinner_tick: u32,
-    /// Herdr theme name (e.g. "tokyonight", "tokyonight-storm") from context.
-    pub theme_name: Option<String>,
-    /// Cache key: hash of the last display-list build inputs.
-    /// Used to skip re-sorting every frame when nothing changed.
-    pub cache_key: Option<u64>,
-    /// Cached display list (already searched/filtered).
-    pub cached_displayed: Rc<Vec<DisplayItem>>,
-    /// Total items before search filtering; shown in the status bar count.
-    pub cached_total: usize,
-    /// Lazily-fetched pane runtime state for the All tab (cmd/ssh/cwd).
-    pub others: HashMap<String, PaneOthers>,
-    /// Cached ANSI-stripped pane buffers backing the All tab's content rows.
-    pub contents: HashMap<String, String>,
-}
-
-fn state_file_path() -> PathBuf {
-    crate::tracker::state_dir_or_default().join("state.json")
-}
-
-impl AppState {
-    /// Persist the current category to a temp file so it survives restarts.
-    pub fn save_last_category(&self) {
-        if let Ok(data) = serde_json::to_string(&self.current_category.label())
-            && let Err(e) = std::fs::write(state_file_path(), data)
-        {
-            log::error!("Failed to save last category: {e}");
+        modifiers |= modifier;
+        rest = rest.strip_prefix(prefix)?;
+        if !["C-", "S-", "M-", "A-"].iter().any(|p| rest.starts_with(p)) {
+            break;
         }
     }
-
-    /// Load the last-used category from the temp file (if any).
-    pub fn load_last_category() -> Option<CategoryTab> {
-        let data = std::fs::read_to_string(state_file_path()).ok()?;
-        let label = data.trim().trim_matches('"');
-        CategoryTab::all()
-            .iter()
-            .find(|t| t.label() == label)
-            .cloned()
-    }
-
-    /// Save an arbitrary category tab to the state file.
-    /// Used by --quick-focus to pre-select the tab before the navigator pane opens.
-    pub fn save_category(&self, cat: &CategoryTab) {
-        if let Ok(data) = serde_json::to_string(cat.label())
-            && let Err(e) = std::fs::write(state_file_path(), data)
-        {
-            log::error!("Failed to save category: {e}");
-        }
-    }
+    parse_key_code(rest, modifiers)
 }
 
-impl std::str::FromStr for CategoryTab {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "workspaces" => Ok(CategoryTab::Workspaces),
-            "tabs" => Ok(CategoryTab::Tabs),
-            "agents" => Ok(CategoryTab::Agents),
-            "panes" => Ok(CategoryTab::Panes),
-            "all" => Ok(CategoryTab::All),
-            // Legacy name accepted so existing configs/CLI keep working.
-            "others" => Ok(CategoryTab::All),
-            _ => Err(format!("Unknown category tab: {s}")),
+fn parse_key_code(rest: &str, modifiers: KeyModifiers) -> Option<KeyEvent> {
+    let code = match rest {
+        "Up" => KeyCode::Up,
+        "Down" => KeyCode::Down,
+        "Left" => KeyCode::Left,
+        "Right" => KeyCode::Right,
+        "Enter" => KeyCode::Enter,
+        "Esc" => KeyCode::Esc,
+        "Backspace" => KeyCode::Backspace,
+        "Space" => KeyCode::Char(' '),
+        "Tab" if modifiers.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
+        "Tab" => KeyCode::Tab,
+        _ => {
+            let mut chars = rest.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            KeyCode::Char(c)
         }
-    }
+    };
+    Some(KeyEvent::new(code, modifiers))
 }
 
 #[cfg(test)]
-mod category_tab_tests {
-    use super::*;
+mod location_tests {
+    use serde_json::json;
 
     #[test]
-    fn test_category_tab_from_str_workspaces() {
-        assert_eq!(
-            "workspaces".parse::<CategoryTab>().unwrap(),
-            CategoryTab::Workspaces
-        );
+    fn invocation_context_wins_over_another_clients_focus() {
+        let mut data = crate::test_helpers::snapshot();
+        data.workspaces[1].tabs[0].panes[0].focused = true;
+        let context =
+            json!({"workspace_id":"project","tab_id":"editor","focused_pane_id":"named-notes"});
+        let location = data.active_location(Some(&context));
+        assert_eq!(location.workspace_id.as_deref(), Some("project"));
+        assert_eq!(location.tab_id.as_deref(), Some("editor"));
+        assert_eq!(location.pane_id.as_deref(), Some("named-notes"));
     }
 
     #[test]
-    fn test_category_tab_from_str_tabs() {
-        assert_eq!("tabs".parse::<CategoryTab>().unwrap(), CategoryTab::Tabs);
+    fn missing_tab_and_workspace_are_derived_from_the_invoking_pane() {
+        let data = crate::test_helpers::snapshot();
+        let location = data.active_location(Some(&json!({"focused_pane_id":"named-notes"})));
+        assert_eq!(location.workspace_id.as_deref(), Some("project"));
+        assert_eq!(location.tab_id.as_deref(), Some("editor"));
     }
 
     #[test]
-    fn test_category_tab_from_str_agents() {
-        assert_eq!(
-            "agents".parse::<CategoryTab>().unwrap(),
-            CategoryTab::Agents
-        );
-    }
-
-    #[test]
-    fn test_category_tab_from_str_panes() {
-        assert_eq!("panes".parse::<CategoryTab>().unwrap(), CategoryTab::Panes);
-    }
-
-    #[test]
-    fn test_category_tab_from_str_all() {
-        assert_eq!("all".parse::<CategoryTab>().unwrap(), CategoryTab::All);
-        // Legacy name still maps to the All tab.
-        assert_eq!("others".parse::<CategoryTab>().unwrap(), CategoryTab::All);
-    }
-
-    #[test]
-    fn test_category_tab_from_str_invalid() {
-        assert!("invalid".parse::<CategoryTab>().is_err());
-    }
-
-    #[test]
-    fn test_parse_tabs_full_list_is_passthrough() {
-        // (A missing/empty `[navigator]` section never reaches parse_tabs:
-        // the manifest loader substitutes the full default list first.)
-        let all: Vec<String> = CategoryTab::all()
-            .iter()
-            .map(|t| t.label().to_lowercase())
-            .collect();
-        assert_eq!(parse_tabs(&all), CategoryTab::all().to_vec());
-    }
-
-    #[test]
-    fn test_parse_tabs_reorders_and_hides() {
-        let spec = vec!["all".to_string(), "workspaces".to_string()];
-        assert_eq!(
-            parse_tabs(&spec),
-            vec![CategoryTab::All, CategoryTab::Workspaces]
-        );
-    }
-
-    #[test]
-    fn test_parse_tabs_dedupes_and_drops_unknown() {
-        let spec = vec![
-            "agents".to_string(),
-            "nope".to_string(),
-            " agents ".to_string(),
-            "all".to_string(),
-        ];
-        assert_eq!(
-            parse_tabs(&spec),
-            vec![CategoryTab::Agents, CategoryTab::All]
-        );
-    }
-
-    #[test]
-    fn test_parse_tabs_accepts_legacy_others_alias() {
-        let spec = vec!["others".to_string(), "workspaces".to_string()];
-        assert_eq!(
-            parse_tabs(&spec),
-            vec![CategoryTab::All, CategoryTab::Workspaces],
-            "legacy `others` token maps to the All tab"
-        );
-    }
-
-    #[test]
-    fn test_parse_tabs_empty_or_all_invalid_keeps_all() {
-        // Nothing configured to show: the navigator must keep one tab.
-        assert_eq!(parse_tabs(&[]), vec![CategoryTab::All]);
-        assert_eq!(parse_tabs(&["nope".to_string()]), vec![CategoryTab::All]);
-    }
-
-    // ── OthersFilter::parse ──
-
-    #[test]
-    fn test_others_filter_label_plus_space_activates() {
-        assert_eq!(
-            OthersFilter::parse("cmd deploy"),
-            (Some(OthersFilter::Source(OtherSource::Cmd)), "deploy")
-        );
-        assert_eq!(
-            OthersFilter::parse("ssh "),
-            (Some(OthersFilter::Source(OtherSource::Ssh)), "")
-        );
-        assert_eq!(
-            OthersFilter::parse("cwd /var/log"),
-            (Some(OthersFilter::Source(OtherSource::Cwd)), "/var/log")
-        );
-        assert_eq!(
-            OthersFilter::parse("ws auth"),
-            (Some(OthersFilter::Workspace), "auth")
-        );
-        assert_eq!(OthersFilter::parse("tab "), (Some(OthersFilter::Tab), ""));
-        assert_eq!(
-            OthersFilter::parse("tab main"),
-            (Some(OthersFilter::Tab), "main")
-        );
-        assert_eq!(
-            OthersFilter::parse("pane nvim"),
-            (Some(OthersFilter::Pane), "nvim")
-        );
-    }
-
-    #[test]
-    fn test_others_filter_bare_label_stays_search_text() {
-        // No trailing space: the label is ordinary fuzzy text.
-        assert_eq!(OthersFilter::parse("cmd"), (None, "cmd"));
-        assert_eq!(OthersFilter::parse("ws"), (None, "ws"));
-        assert_eq!(OthersFilter::parse("tab"), (None, "tab"));
-        assert_eq!(OthersFilter::parse("pane"), (None, "pane"));
-        // A label-shaped prefix that is not exactly the label is plain text.
-        assert_eq!(OthersFilter::parse("cmdx rest"), (None, "cmdx rest"));
-        assert_eq!(OthersFilter::parse("tabx rest"), (None, "tabx rest"));
-        // A label in the middle of the query never activates a filter.
-        assert_eq!(OthersFilter::parse("deploy cmd"), (None, "deploy cmd"));
-        assert_eq!(OthersFilter::parse("deploy ws"), (None, "deploy ws"));
-    }
-
-    #[test]
-    fn test_others_filter_ws_tab_not_source_aliases() {
-        // `term` is a source label, `tab` is a dimension filter: distinct.
-        assert_eq!(
-            OthersFilter::parse("term "),
-            (Some(OthersFilter::Source(OtherSource::Terminal)), "")
-        );
-        assert_eq!(OthersFilter::parse("tab "), (Some(OthersFilter::Tab), ""));
-        // Source labels still win over ws/tab.
-        assert_eq!(
-            OthersFilter::parse("cmd deploy"),
-            (Some(OthersFilter::Source(OtherSource::Cmd)), "deploy")
-        );
-    }
-
-    #[test]
-    fn test_others_filter_labels() {
-        assert_eq!(OthersFilter::Content.label(), "content");
-        assert_eq!(OthersFilter::Workspace.label(), "ws");
-        assert_eq!(OthersFilter::Tab.label(), "tab");
-        assert_eq!(OthersFilter::Pane.label(), "pane");
-        assert_eq!(
-            OthersFilter::Source(OtherSource::Ssh).label(),
-            OtherSource::Ssh.label()
-        );
-    }
-
-    #[test]
-    fn test_others_filter_dot_and_dot_label_combo() {
-        assert_eq!(
-            OthersFilter::parse(".deploy"),
-            (Some(OthersFilter::Content), "deploy")
-        );
-        // `.file ` narrows past content down to the file source.
-        assert_eq!(
-            OthersFilter::parse(".file todo"),
-            (Some(OthersFilter::Source(OtherSource::File)), "todo")
-        );
-    }
-
-    #[test]
-    fn test_category_tab_from_str_case_sensitive() {
-        assert!("Workspaces".parse::<CategoryTab>().is_err());
-    }
-}
-
-#[cfg(test)]
-mod other_source_tests {
-    use super::*;
-
-    #[test]
-    fn test_other_source_labels() {
-        assert_eq!(OtherSource::Ssh.label(), "ssh");
-        assert_eq!(OtherSource::Cmd.label(), "cmd");
-        assert_eq!(OtherSource::Cwd.label(), "cwd");
-        assert_eq!(OtherSource::File.label(), "file");
-        assert_eq!(OtherSource::Terminal.label(), "term");
-    }
-
-    #[test]
-    fn test_other_source_priority_order() {
-        assert!(OtherSource::Ssh.priority() < OtherSource::Cmd.priority());
-        assert!(OtherSource::Cmd.priority() < OtherSource::File.priority());
-        assert!(OtherSource::File.priority() < OtherSource::Cwd.priority());
-    }
-}
-
-#[cfg(test)]
-mod agent_status_tests {
-    use super::*;
-
-    #[test]
-    fn test_agent_status_is_active_working() {
-        assert!(AgentStatus::Working.is_active());
-    }
-
-    #[test]
-    fn test_agent_status_is_active_done() {
-        assert!(!AgentStatus::Done.is_active());
-    }
-
-    #[test]
-    fn test_agent_status_is_active_blocked() {
-        assert!(!AgentStatus::Blocked.is_active());
-    }
-
-    #[test]
-    fn test_agent_status_is_active_idle() {
-        assert!(!AgentStatus::Idle.is_active());
-    }
-
-    #[test]
-    fn test_agent_status_is_active_none() {
-        assert!(!AgentStatus::None.is_active());
+    fn direct_launch_uses_focused_pane_when_context_is_absent() {
+        let mut data = crate::test_helpers::snapshot();
+        data.workspaces[0].tabs[0].panes[0].focused = true;
+        let location = data.active_location(None);
+        assert_eq!(location.pane_id.as_deref(), Some("named-notes"));
+        assert_eq!(location.tab_id.as_deref(), Some("editor"));
     }
 }

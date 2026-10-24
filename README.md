@@ -1,296 +1,274 @@
-# Herdr Recent Navigator
+# Herdr Canopy
 
-A recent workspaces/tabs/panes switcher for [Herdr](https://herdr.dev/). Opens an popup listing
-recently focused workspaces, tabs, panes, and AI agents — fuzzy-searchable and
-navigable by keyboard.
+Navigate [Herdr](https://herdr.dev/) workspaces, worktrees, tabs, and panes from a
+searchable tree, with agent activity visible alongside each destination.
 
-![Screenshot](https://github.com/beyondlex/images/blob/main/recent-navigator.jpg)
+Open the popup and press Enter to reach the pane that needs your attention most.
+Blocked agents come first, followed by unseen completions, working agents, and
+recent panes. Type to find a destination, or browse the tree with the arrow keys.
+Agent status bubbles and working times update while the navigator is open.
 
-<p align="center">
-  <img alt="Herdr 0.7.4+" src="https://img.shields.io/badge/Herdr-0.7.4%2B-6693ff" />
-  <img alt="Linux and macOS" src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-2eb14f" />
-  <img alt="Release" src="https://img.shields.io/github/v/release/beyondlex/herdr-recent-navigator" />
-  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/License-MIT-cd933e" /></a>
-</p>
-
-## Demo
-
-<p align="center">
-  <img alt="demo" src="https://github.com/beyondlex/images/blob/main/recent-navigator.gif" width="559px" />
-</p>
-<p>
-  <img alt="cmd" src="https://github.com/beyondlex/images/blob/main/recent_navigator_cmd.png" />
-</p>
-<p>
-  <img alt="cmd" src="https://github.com/beyondlex/images/blob/main/recent-navigator-content.png" />
-</p>
-
-## Features
-
-- **Four category tabs**: Workspaces, Tabs, Agents, Panes — switch with `Tab`
-- **MRU ordering**: most recently focused items float to the top
-- **Fuzzy search**: type to filter any category
-- **Customizable quick-jump shortcuts**: Bind separate keys to open each tab
-  directly — e.g. `prefix+u` → Workspaces, `cmd+i` → Tabs,
-  `cmd+e` → Agents, `cmd+shift+n` → Panes
-- **Cross-category filtering**: Open the Agents tab and fuzzy-filter by
-  workspace name to find all agents under a specific workspace; similarly
-  filter Panes by tab name, or Tabs by workspace — no need to navigate
-  through the tree
-- **Live agent status**: Working agents show a braille spinner; status updates
-  in real time without reopening
-- **Herdr-native colors**: TokyoNight palette, consistent with the Herdr UI
-- **Automatic tracking**: hooks into `workspace.focused`, `pane.focused`,
-  `tab.focused` events to build `MRU` history
-
-## Install
-
-> **Warning:** Requires Herdr **≥ 0.7.4**. Check with `herdr -V`.  
-> To upgrade Herdr, see [herdr.dev/docs/install/#update](https://herdr.dev/docs/install/#update).
-
-Choose one of the following:
-
-### A. Quick install (curl | bash)
-
-Downloads a prebuilt binary to `~/.local/bin/` and links it into Herdr:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/beyondlex/herdr-recent-navigator/main/install.sh | bash
+```text
+ Project                                ● ● 
+├─  Editor                                ● 
+│  ├─ ✳ notes                         1m 5s  ●
+│  └─ ֎ review                               
+└─  fix-tests                               ●
+   └─  Tests                                ●
+      └─ ֎ runner                       12s  ●
 ```
 
-> **Recommendation:** Use this method — no Rust toolchain required.
+- **One tree:** workspaces contain tabs and panes; linked worktrees add a branch
+  beneath their main workspace.
+- **Attention-aware switching:** blocked, completed, and working agents take
+  priority, with recent focus breaking ties.
+- **Compact by default:** see workspace groups, agent panes, and the path to the
+  preferred destination. Press Tab for the full tree.
+- **Agent activity:** provider icons, status bubbles, and working times for Codex
+  and Claude help you find work that needs attention.
+- **Terminal colors:** the popup follows your terminal palette and Herdr theme.
 
-### B. Install via Herdr plugin manager
+## Installation
 
-```bash
-herdr plugin install beyondlex/herdr-recent-navigator
+Requires macOS or Linux, Herdr **0.9.5 or later**, and a Rust toolchain. Use a
+[Nerd Font](https://www.nerdfonts.com/) in your terminal for the workspace, tab,
+and pane glyphs.
+
+Install from GitHub with Herdr's plugin manager:
+
+```sh
+herdr plugin install serhez/herdr-canopy
 ```
 
-Herdr clones the repo, builds from source, and registers the plugin
-automatically.
+Or clone, build, and link a local checkout:
 
-### C. Build from source (manual)
-
-```bash
-git clone https://github.com/beyondlex/herdr-recent-navigator
-cd herdr-recent-navigator
-cargo build --release
+```sh
+git clone https://github.com/serhez/herdr-canopy.git
+cd herdr-canopy
+cargo build --release --locked
 herdr plugin link "$PWD"
 ```
 
-## Upgrade
+### Bind a shortcut
 
-| Current install method | Upgrade command |
-|---|---|
-| curl \| bash | Re-run the curl command |
-| `herdr plugin install` | `herdr plugin uninstall beyondlex.herdr-recent-navigator && herdr plugin install beyondlex/herdr-recent-navigator` |
-| Build from source | `git pull && cargo build --release && herdr plugin unlink beyondlex.herdr-recent-navigator && herdr plugin link "$PWD"` |
-
-## Bind a shortcut
-
-Add to your Herdr config:
+Add a command binding to Herdr's `config.toml`, replacing any existing binding
+for the same key:
 
 ```toml
 [[keys.command]]
-key = "cmd+e"
+key = "cmd+s"
 type = "plugin_action"
-command = "beyondlex.herdr-recent-navigator.focus-workspaces"
-description = "Open Navigator: Workspace"
-
-
-# Optional: Focus Tabs/Panes/Agents when open navigator
-[[keys.command]]
-key = "cmd+i"
-type = "plugin_action"
-command = "beyondlex.herdr-recent-navigator.focus-tabs"
-description = "Open Navigator: Tab"
-
-[[keys.command]]
-key = "prefix+u"
-type = "plugin_action"
-command = "beyondlex.herdr-recent-navigator.focus-panes"
-description = "Open Navigator: Pane"
-
-[[keys.command]]
-key = "prefix+o"
-type = "plugin_action"
-command = "beyondlex.herdr-recent-navigator.focus-agents"
-description = "Open Navigator: Agent"
+command = "serhez.herdr-canopy.toggle"
+description = "Toggle workspace tree"
 ```
 
-Reload:
+Reload Herdr's configuration:
 
-```bash
+```sh
 herdr server reload-config
 ```
 
-Press the shortcut to open the navigator popup.
+Press Cmd+S to open the navigator; press it again to close it. Choose another key
+in Herdr's configuration if you prefer. The plugin does not reserve a shortcut
+internally.
 
-### Quick-focus: jump to previous tab/pane/agent without opening the UI
+You can also invoke it from a Herdr terminal:
 
-Three plugin actions focus the most recently focused tab, pane, or agent directly
-via MRU history, no dialog needed:
-
-```toml
-[[keys.command]]
-key = "prefix+t"
-type = "plugin_action"
-command = "beyondlex.herdr-recent-navigator.focus-previous-tab"
-description = "Jump to previous tab"
-
-[[keys.command]]
-key = "cmd+y"
-type = "plugin_action"
-command = "beyondlex.herdr-recent-navigator.focus-previous-pane"
-description = "Jump to previous pane"
-
-[[keys.command]]
-key = "prefix+a"
-type = "plugin_action"
-command = "beyondlex.herdr-recent-navigator.focus-previous-agent"
-description = "Jump to previous agent"
+```sh
+herdr plugin action invoke serhez.herdr-canopy.toggle
 ```
 
-The tab and pane actions use the second MRU entry, mirroring GNU screen's
-alt-tab workflow. The agent action skips the currently focused agent; from a
-non-agent pane it jumps to the most recently focused agent.
+| Plugin action | Behavior |
+| --- | --- |
+| `serhez.herdr-canopy.toggle` | Open the navigator, or close its active popup |
+| `serhez.herdr-canopy.open` | Open the navigator, keeping an existing instance open |
+
+## Navigation
+
+Each popup starts in **compact view**: workspaces and linked worktrees, every
+pane containing an agent, and the preselected preferred destination, with their
+ancestors. Agent panes appear regardless of provider or status, including unnamed
+panes. Press **Tab** for the full tree, which also includes other tabs and
+manually named panes. `[all]` beside the search input indicates full view.
+
+### Attention-aware MRU
+
+Selectable panes follow this priority:
+
+1. **Blocked agents (red):** agents waiting for attention.
+2. **Unseen completions (blue):** agents Herdr reports as done, before you visit them.
+3. **Working agents (yellow):** agents actively working.
+4. **Other panes:** idle agents, unknown states, and named panes without agents.
+
+Within each group, the most recently focused pane comes first. This priority
+applies across tabs, worktrees, and workspaces: each branch is ordered by its
+highest-priority eligible pane and that pane's recency. A recent parent focus
+cannot override a pane's priority. Workspace and worktree groups stay together in
+the tree.
+
+The highest-priority eligible pane is preselected on opening. When no agent needs
+attention or is working, this returns you to the most recent eligible pane. If
+there are no selectable panes, the navigator falls back to a recent tab or
+workspace. Herdr supplies the agent states; a completed agent loses its blue
+priority when Herdr marks it seen/idle after a visit.
+
+### Search
+
+Type to fuzzy-search workspace, worktree, tab, and pane names, case insensitively.
+A workspace, worktree, or tab name match reveals its eligible panes and their
+ancestors. A pane-name match keeps its ancestors for context without revealing
+unrelated branches. Unnamed panes without agents remain excluded.
+
+Search preselects the **first selectable pane** in the ordered results, even when
+a workspace, worktree, tab, or another pane has a better fuzzy-name score. Panes
+and branches retain the attention-aware MRU order. If only the current pane
+matches, its dimmed context row is selected; if no pane matches, a matching
+container remains available.
+
+Search temporarily opens matching branches. Clearing it restores your collapsed
+branches and the preferred destination selection. Live refreshes and full-view
+toggling preserve your selected destination when it remains visible.
+
+The current workspace and tab are context rows. The current agent pane also
+stays visible as context: its text and icon are dimmed, while its bubble keeps its
+status color. These rows cannot switch focus to the current location. The current
+pane without an agent stays hidden. When a main workspace is closed, its linked
+worktrees use a repository grouping row; Enter on that row moves into its children.
+
+| Key | Action |
+| --- | --- |
+| Tab | Toggle compact/full view |
+| Up / Ctrl+P | Previous row |
+| Down / Ctrl+N | Next row |
+| Right | Expand a branch, or move to its first child |
+| Left | Collapse a branch, or move to its parent |
+| Enter | Focus the selected destination |
+| Esc | Clear search; close when search is empty |
+| Ctrl+C | Close |
+| Backspace | Delete the last search character |
+
+Collapsed branches show `[+]`. Selecting a pane focuses it with zoom disabled.
+
+### Names and icons
+
+Workspace, worktree, and tab rows use ``, ``, and ``. Panes use ``, replaced
+by `֎` for Codex, `✳` for Claude, or `◇` for another agent provider.
+
+Manual pane names take precedence. An unnamed agent pane uses its cleaned
+terminal title, then its raw title, then the agent type and pane ID. These are
+display labels; the navigator does not rename panes. Unnamed panes without agents
+are excluded from both views.
+
+Long names end with `…`, preserving whole Unicode characters and emoji. Search
+still uses the full name. Working times stay complete while names shorten.
+
+## Agent activity
+
+The right side of each row shows one bubble per nested agent, including agents
+in hidden, unnamed, or current panes. Workspace totals include linked worktrees.
+Bubbles are ordered by status:
+
+| Status | Color | Marker |
+| --- | --- | --- |
+| Blocked | Red | `●` |
+| Working | Yellow | `●` |
+| Done | Blue | `●` |
+| Idle / ready | Green | `` |
+| Unknown | Muted gray | `●` |
+
+Agent detection, tree contents, and bubble counts and colors refresh every two
+seconds. Selection follows the same destination through name and status changes.
+
+### Working times
+
+Working Codex and Claude panes show elapsed time immediately before their bubble,
+with two spaces between them: `5s  ●`. Timers tick every second and show only
+nonzero units, without padding: `5s`, `1m 5s`, `1h 5s`, or `1d 2h 3m 4s`.
+Other providers, nonworking agents, and parent rows have no timer.
+
+Timing starts when the plugin receives a Herdr working-status event, continues
+while the popup is closed, and resets for each new working period. Tracking is
+registered when you link the plugin. An agent already working before tracking
+begins has no known start, so its timer stays blank until the next observed
+working period. Zero elapsed seconds are also blank.
+
+Time and bubbles share the existing status area. The complete timer takes
+priority over name space; if the terminal cannot fit it with its bubble and at
+least one name cell, the timer is omitted entirely.
 
 ## Configuration
 
-User settings live in `config.toml` inside the plugin's config directory, which
-Herdr keeps separate from the plugin files so upgrades never overwrite it:
-
-```bash
-herdr plugin config-dir beyondlex.herdr-recent-navigator
-# usually ~/.config/herdr/plugins/config/beyondlex.herdr-recent-navigator
-```
-
-Create `config.toml` there (the installer seeds a commented template if the
-file doesn't exist). `theme`, `[keybindings]` and `[navigator]` all go in this one file:
-
-```toml
-theme = "light"
-
-[keybindings]
-move_up = ["Up", "C-k"]
-move_down = ["Down", "C-j"]
-```
-
-Settings still in `herdr-plugin.toml` (the old location) are honored as a
-fallback, but the installer regenerates that file on every upgrade, so move
-anything you've customized into `config.toml`.
-
-### Theme
-
-```toml
-theme = "light"        # "dark" (default) or "light"
-```
-
-The navigator uses a dark TokyoNight palette by default. Set `theme = "light"`
-for a light palette. Full per-theme auto-detection will be added once Herdr
-sends the theme name via `HERDR_PLUGIN_CONTEXT_JSON`.
-
 ### Keybindings
 
-All internal navigation keys are configurable via the `[keybindings]` section.
-Each action accepts a list of key strings (multiple bindings per action).
+Find the plugin's configuration directory:
+
+```sh
+herdr plugin config-dir serhez.herdr-canopy
+```
+
+Create `config.toml` there to override navigation keys. Unspecified bindings keep
+their defaults. The defaults are:
 
 ```toml
 [keybindings]
-next_category = ["Tab"]
-previous_category = ["S-Tab"]
+toggle_all = ["Tab"]
 move_up = ["Up", "C-p"]
 move_down = ["Down", "C-n"]
+expand = ["Right"]
+collapse = ["Left"]
 select = ["Enter"]
 dismiss = ["Esc"]
 force_quit = ["C-c"]
 backspace = ["Backspace"]
 ```
 
-#### Key syntax
+Bindings accept named keys, literal characters, and `C-`, `S-`, `M-`/`A-`
+modifiers. Settings are read when the popup opens. Configure the shortcut that
+opens the popup separately in Herdr.
 
-| Format | Meaning |
-|---|---|
-| `Tab`, `Up`, `Down`, `Enter`, `Esc`, `Backspace`, `Space` | Special keys |
-| `S-Tab` | Shift+Tab (same as `BackTab`) |
-| `a`...`z`, `0`...`9` | Literal character |
-| `C-a`...`C-z` | Ctrl + character |
-| `S-a`...`S-z` | Shift + character |
-| `M-a`...`M-z` or `A-a`...`A-z` | Alt + character |
-| `C-S-a` | Ctrl + Shift + a |
-| `C-M-a` | Ctrl + Alt + a |
+### Appearance
 
-**Note:** Terminal support for Alt+key combinations is limited. Some
-terminals send `Esc` + `key` instead of a distinct Alt+key event. Prefer
-Ctrl-based combinations when possible.
+The popup is **65 columns × 30 rows**. To change its dimensions, edit `width` and
+`height` in the `navigator` pane entry of `herdr-plugin.toml`, then relink the
+plugin. The new size applies the next time you open it.
 
-#### Default bindings
+Colors follow the terminal's ANSI palette and default foreground, with overrides
+from Herdr's `[theme.custom]` settings. The plugin reads `HERDR_CONFIG_PATH`, then
+`$XDG_CONFIG_HOME/herdr/config.toml`, then `~/.config/herdr/config.toml`.
 
-| Action | Default keys | Description |
-|---|---|---|
-| `next_category` | `Tab` | Next category tab |
-| `previous_category` | `S-Tab` | Previous category tab |
-| `move_up` | `Up`, `C-p` | Move selection up |
-| `move_down` | `Down`, `C-n` | Move selection down |
-| `select` | `Enter` | Focus selected item |
-| `dismiss` | `Esc` | Clear search / close |
-| `force_quit` | `C-c` | Close without focusing |
-| `backspace` | `Backspace` | Delete last search character |
+The background uses `sidebar_bg`, then `surface_dim`, then a darker shade of RGB
+`panel_bg`, falling back to ANSI black. Selection uses `active_row_bg` or
+`selection_bg`, falling back to ANSI dark gray. Gray tree guides and horizontal
+rules separate workspace groups and the search input.
 
-### Tab order and visibility
+Icons use blue for workspaces, mauve/purple for worktrees, yellow for tabs,
+peach/orange for Claude, and teal for other agents. Codex icons follow ANSI
+palette index 6, which is Kitty's `color6`. Corresponding Herdr custom tokens
+override the other icon and status colors. Search highlights use `ui.accent`,
+then the custom accent, then ANSI cyan.
 
-The order of the top-level category tabs — and which tabs appear at all — is
-configured with a single array in the plugin's `config.toml` (see
-[Configuration](#configuration)): position is display order, and a tab left
-out of the list is hidden entirely. Like `theme` and `[keybindings]`,
-`herdr-plugin.toml` is only read as a fallback when `config.toml` has no
-`[navigator]` section — the installer regenerates the manifest on upgrade.
+Working times use the lighter `subtext0` gray, falling back to ANSI gray. Disabled
+text and tree guides use the darker `overlay0` gray, falling back to ANSI dark
+gray. The current pane's timer keeps that disabled text color.
 
-```toml
-[navigator]
-tabs = ["workspaces", "tabs", "panes", "agents", "all"]
+## Development
+
+```sh
+cargo test --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo fmt --check
+cargo run --locked -- --mock
 ```
 
-- Valid names: `workspaces`, `tabs`, `panes`, `agents`, `all`
-- Unknown names are ignored; duplicates collapse to the first occurrence
-- At least one tab is always kept — an empty (or all-invalid) list falls back
-  to `all` only
-- `others` is accepted as a legacy alias for `all`
+The mock preview uses sample data without connecting to Herdr. Live connection
+failures are reported; a failed refresh keeps the last complete tree and shows
+an error.
 
-## Usage
+## Credits and license
 
-| Key (default) | Action |
-|---|---|
-| `↑` / `↓` or `Ctrl+P` / `Ctrl+N` | Navigate list |
-| `Tab` / `Shift+Tab` | Cycle category tabs |
-| `Enter` | Focus selected item |
-| `Esc` | Clear search / close |
-| `Ctrl+C` | Close without focusing |
-| Type any text | Fuzzy-search the list |
+Originally derived from [Herdr Recent Navigator](https://github.com/beyondlex/herdr-recent-navigator)
+by [beyondlex](https://github.com/beyondlex). Herdr Canopy is independently
+maintained with its own tree interface, navigation behavior, and agent activity
+tracking.
 
-All keys in the table above are configurable — see [Keybindings](#keybindings)
-to customize.
-
-### Category tabs
-
-- **Workspaces**: MRU workspaces with dot indicators for agent status.
-  Linked git worktrees show as `<repo> ⎇ <worktree>` directly under their
-  main-checkout workspace, and typing the repo name finds them
-- **Tabs**: MRU tabs within those workspaces
-- **Agents**: AI agents sorted by last activity
-- **Panes**: Individual terminal panes
-- **All**: find panes by runtime state — ssh target, foreground command,
-  cwd — and by buffer content: any query also substring-matches pane
-  scrollback and shows a one-line excerpt around each hit. A filter prefix
-  narrows the search to one source and shows as a badge next to the input:
-  type `cmd `, `ssh `, `cwd `, `file `, or `term ` (label + space), or `.`
-  for buffer content only (`.` shorthand: `.file` = file buffers only).
-  `ws `, `tab ` and `pane ` swap the list to the workspace, tab or pane
-  list — type a name to fuzzy-filter down to it (e.g. `ws auth` = workspaces
-  matching "auth", `pane nvim` = panes matching "nvim").
-
-
-## License
-
-MIT
-
+Licensed under the [MIT License](LICENSE).

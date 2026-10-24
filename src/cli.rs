@@ -1,39 +1,42 @@
 use clap::{Parser, Subcommand};
 
-/// Herdr Recent Navigator — a recent items switcher for Herdr.
+/// Fuzzy tree navigation for Herdr workspaces, tabs, named panes, and agent panes.
 #[derive(Debug, Parser)]
-#[command(name = "herdr-recent-navigator", version, about)]
+#[command(name = "herdr-canopy", version, about)]
 pub struct Cli {
-    /// Optional subcommand (track mode)
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Default view category tab to open.
-    #[arg(long = "view", value_parser = ["workspaces", "tabs", "agents", "panes", "all", "others"])]
-    pub view: Option<String>,
-
-    /// Open the overlay pane (called by plugin_action keybinding).
-    #[arg(long = "pane-open")]
+    /// Open the navigator popup in Herdr.
+    #[arg(long)]
     pub pane_open: bool,
 
-    /// Use mock data instead of connecting to Herdr (for development).
+    /// Use sample data without connecting to Herdr.
     #[cfg(feature = "mock")]
-    #[arg(long = "mock")]
+    #[arg(long)]
     pub mock: bool,
-
-    /// Write logs to this file instead of stderr (for development).
-    #[arg(long = "log-file")]
-    pub log_file: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Record a pane.focused event to the MRU state file.
+    /// Toggle this session's navigator popup.
+    Toggle,
+    /// Record workspace, tab, and pane focus for recent location ordering.
     Track,
-    /// Focus the most recent tab (previous tab) without opening the navigator UI.
-    QuickFocusPreviousTab,
-    /// Focus the most recent pane (previous pane) without opening the navigator UI.
-    QuickFocusPreviousPane,
-    /// Focus the most recently used agent without opening the navigator UI.
-    QuickFocusPreviousAgent,
+    /// Record working periods from Herdr agent lifecycle events.
+    TrackWork,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exposes_a_single_mode_without_view_categories() {
+        assert!(Cli::try_parse_from(["herdr-canopy", "--pane-open"]).is_ok());
+        assert!(Cli::try_parse_from(["herdr-canopy", "--view", "agents"]).is_err());
+        assert!(Cli::try_parse_from(["herdr-canopy", "track"]).is_ok());
+        assert!(Cli::try_parse_from(["herdr-canopy", "track-work"]).is_ok());
+        assert!(Cli::try_parse_from(["herdr-canopy", "toggle"]).is_ok());
+    }
 }

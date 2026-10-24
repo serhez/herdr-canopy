@@ -1,923 +1,1201 @@
-use crate::format::*;
-use crate::models::{
-    AgentStatus, AppState, CategoryTab, DisplayItem, Keybindings, OtherSource, OthersFilter,
-    WORKTREE_SEP,
+use crate::{
+    app::{AppState, RowKind},
+    models::{AgentProvider, AgentStatus},
+    theme::Palette,
 };
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs};
-use unicode_width::UnicodeWidthStr;
+use ratatui::{
+    Frame,
+    layout::{Constraint, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Cell, Paragraph, Row as TableRow, Table, TableState},
+};
 
-// ── Palette ──────────────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-struct Palette {
-    accent: Color,
-    surface0: Color,
-    surface1: Color,
-    surface_dim: Color,
-    overlay0: Color,
-    overlay1: Color,
-    text: Color,
-    subtext0: Color,
-    mauve: Color,
-    green: Color,
-    yellow: Color,
-    red: Color,
-    blue: Color,
-    teal: Color,
-    peach: Color,
+pub fn render(frame: &mut Frame, app: &AppState, palette: &Palette) {
+    render_at(
+        frame,
+        app,
+        palette,
+        crate::tracker::unix_millis().unwrap_or_default(),
+    );
 }
 
-impl Palette {
-    fn dark() -> Self {
-        Self {
-            accent: Color::Rgb(122, 162, 247),   // #7aa2f7
-            surface0: Color::Rgb(36, 40, 59),    // #24283b
-            surface1: Color::Rgb(65, 72, 104),   // #414868
-            surface_dim: Color::Rgb(26, 27, 38), // #1a1b26
-            overlay0: Color::Rgb(86, 95, 137),   // #565f89
-            overlay1: Color::Rgb(105, 113, 150), // #69719e
-            text: Color::Rgb(192, 202, 245),     // #c0caf5
-            subtext0: Color::Rgb(169, 177, 214), // #a9b1d6
-            mauve: Color::Rgb(187, 154, 247),    // #bb9af7
-            green: Color::Rgb(158, 206, 106),    // #9ece6a
-            yellow: Color::Rgb(224, 175, 104),   // #e0af68
-            red: Color::Rgb(247, 118, 142),      // #f7768e
-            blue: Color::Rgb(122, 162, 247),     // #7aa2f7
-            teal: Color::Rgb(125, 207, 255),     // #7dcfff
-            peach: Color::Rgb(255, 158, 100),    // #ff9e64
+fn format_duration(seconds: u64) -> String {
+    [
+        (seconds / 86400, "d"),
+        (seconds / 3600 % 24, "h"),
+        (seconds / 60 % 60, "m"),
+        (seconds % 60, "s"),
+    ]
+    .into_iter()
+    .filter(|(value, _)| *value > 0)
+    .map(|(value, unit)| format!("{value}{unit}"))
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+fn ellipsize(line: Line<'_>, width: usize, style: Style) -> Line<'_> {
+    if width == 0 {
+        return Line::default();
+    }
+    if line.width() <= width {
+        return line;
+    }
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let cells = Span::raw(grapheme.symbol).width();
+        if used + cells > width - 1 {
+            break;
         }
+        spans.push(Span::styled(grapheme.symbol.to_owned(), grapheme.style));
+        used += cells;
     }
-
-    fn light() -> Self {
-        Self {
-            accent: Color::Rgb(46, 125, 233),       // #2e7de9
-            surface0: Color::Rgb(203, 204, 209),    // #cbccd1
-            surface1: Color::Rgb(216, 217, 222),    // #d8d9de
-            surface_dim: Color::Rgb(239, 241, 245), // #eff1f5
-            overlay0: Color::Rgb(156, 157, 165),    // #9c9da5
-            overlay1: Color::Rgb(139, 140, 148),    // #8b8d94
-            text: Color::Rgb(55, 96, 191),          // #3760bf
-            subtext0: Color::Rgb(97, 114, 176),     // #6172b0
-            mauve: Color::Rgb(120, 71, 189),        // #7847bd
-            green: Color::Rgb(88, 117, 57),         // #587539
-            yellow: Color::Rgb(143, 94, 21),        // #8f5e15
-            red: Color::Rgb(245, 42, 101),          // #f52a65
-            blue: Color::Rgb(46, 125, 233),         // #2e7de9
-            teal: Color::Rgb(0, 113, 151),          // #007197
-            peach: Color::Rgb(177, 92, 0),          // #b15c00
-        }
+    if used < width - 1 {
+        spans.push(Span::raw(" ".repeat(width - 1 - used)));
     }
-
-    fn for_theme(theme_name: Option<&str>) -> Self {
-        match theme_name {
-            Some(n) if is_light_theme(n) => Self::light(),
-            _ => Self::dark(),
-        }
-    }
+    spans.push(Span::styled("…", style));
+    Line::from(spans)
 }
 
-fn is_light_theme(name: &str) -> bool {
-    let name = name.trim().to_ascii_lowercase();
-    // Accept a bare "light" so an explicit manifest value works as written.
-    name == "light"
-        || name.ends_with("-latte")
-        || name.ends_with("-light")
-        || name.ends_with("-day")
-        || name.ends_with("-dawn")
-        || name.ends_with("-lotus")
-}
-
-// ── Braille spinner frames (herdr-compatible) ───────────────────────────────
-
-const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-fn spinner_frame(tick: u32) -> &'static str {
-    SPINNERS[(tick as usize / 3) % SPINNERS.len()]
-}
-
-// ── Status helpers (herdr-compatible) ───────────────────────────────────────
-
-fn state_dot(st: &AgentStatus, p: &Palette) -> (&'static str, Style) {
-    match st {
-        AgentStatus::Blocked => ("●", Style::default().fg(p.red)),
-        AgentStatus::Working => ("●", Style::default().fg(p.yellow)),
-        AgentStatus::Done => ("●", Style::default().fg(p.teal)),
-        AgentStatus::Idle => ("○", Style::default().fg(p.green)),
-        AgentStatus::None => ("·", Style::default().fg(p.overlay0)),
-    }
-}
-
-fn agent_icon(st: &AgentStatus, tick: u32, p: &Palette) -> (&'static str, Style) {
-    match st {
-        AgentStatus::Blocked => ("◉", Style::default().fg(p.red)),
-        AgentStatus::Working => (spinner_frame(tick), Style::default().fg(p.yellow)),
-        AgentStatus::Done => ("●", Style::default().fg(p.teal)),
-        AgentStatus::Idle => ("✓", Style::default().fg(p.green)),
-        AgentStatus::None => ("○", Style::default().fg(p.overlay0)),
-    }
-}
-
-fn num_span(i: usize, sel: bool, p: &Palette) -> Span<'static> {
-    Span::styled(
-        format!("{:>2}. ", i + 1),
-        Style::default().fg(if sel { p.text } else { p.overlay0 }),
-    )
-}
-
-fn name_style(sel: bool, p: &Palette) -> Style {
-    if sel {
-        Style::default().fg(p.text).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    }
-}
-
-fn ctx_style(sel: bool, p: &Palette) -> Style {
-    Style::default().fg(if sel { p.text } else { p.overlay0 })
-}
-
-fn hl_style(sel: bool, p: &Palette) -> Style {
-    let mut s = Style::default().fg(p.yellow);
-    if sel {
-        s = s.add_modifier(Modifier::BOLD);
-    }
-    s
-}
-
-fn row_sel_style(sel: bool, p: &Palette) -> Style {
-    if sel {
-        Style::default().bg(p.surface1).fg(p.text)
-    } else {
-        Style::default()
-    }
-}
-
-// ── Public render entry point ───────────────────────────────────────────────
-
-pub fn render(frame: &mut Frame, state: &AppState, displayed: &[DisplayItem], total: usize) {
-    let p = Palette::for_theme(state.theme_name.as_deref());
+fn render_at(frame: &mut Frame, app: &AppState, palette: &Palette, now_ms: u64) {
     let area = frame.area();
-
-    // Minimum terminal size guard
-    if !min_terminal_size(area) {
-        let msg = "Terminal too small — resize to at least 20×4";
+    let style = Style::default().bg(palette.background).fg(palette.text);
+    frame.render_widget(Block::default().style(style), area);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(u16::from(app.error.is_some())),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    let mut prompt = vec![Span::styled(" > ", Style::default().fg(palette.accent))];
+    if app.query.is_empty() {
+        prompt.push(Span::styled(
+            "Search workspaces, tabs, panes",
+            Style::default().fg(palette.muted),
+        ));
+    } else {
+        prompt.push(Span::raw(&app.query));
+    }
+    if app.show_all {
+        prompt.push(Span::styled("  [all]", Style::default().fg(palette.muted)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(prompt)).style(style), chunks[0]);
+    if let Some(error) = &app.error {
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(p.red))))
-                .style(Style::default().bg(p.surface_dim)),
-            area,
+            Paragraph::new(error.as_str()).style(style.fg(palette.red)),
+            chunks[1],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("─".repeat(area.width as usize)).style(style.fg(palette.muted)),
+        chunks[2],
+    );
+    if app.rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" No matches").style(style.fg(palette.muted)),
+            chunks[3],
         );
         return;
     }
-
-    let narrow = area.width < 60;
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(p.surface_dim)),
-        area,
-    );
-    let inner = area;
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(1),
-            Constraint::Length(2),
-        ])
-        .split(inner);
-
-    let matched = displayed.len();
-    render_tabs(frame, state, chunks[0], &p, narrow);
-    render_search(frame, state, chunks[1], matched, total, &p);
-
-    let list_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(chunks[2]);
-    // In the All tab a `ws `/`tab `/`pane ` filter swaps the list to
-    // workspace/tab/pane entities, so the column header should match that
-    // dimension's layout.
-    let header_category = if state.current_category == CategoryTab::All {
-        match OthersFilter::parse(&state.search_query).0 {
-            Some(OthersFilter::Workspace) => CategoryTab::Workspaces,
-            Some(OthersFilter::Tab) => CategoryTab::Tabs,
-            Some(OthersFilter::Pane) => CategoryTab::Panes,
-            _ => CategoryTab::All,
-        }
-    } else {
-        state.current_category
-    };
-    render_column_header(frame, &header_category, list_chunks[0], &p, narrow);
-    // With a filter prefix (`.` / `cmd ` / …) the All rows are keyed by
-    // the remaining text (their `detail` carries the excerpt or the matched
-    // value), so highlight with that — matching the raw query against them
-    // would find nothing.
-    let highlight_query = if state.current_category == CategoryTab::All {
-        OthersFilter::parse(&state.search_query).1
-    } else {
-        state.search_query.as_str()
-    };
-    render_list(
-        frame,
-        displayed,
-        state.selected_index,
-        highlight_query,
-        state.spinner_tick,
-        list_chunks[1],
-        &p,
-    );
-    render_status_bar(frame, chunks[3], &p, narrow, &state.keybindings);
-}
-
-// ── Sub-renderers ───────────────────────────────────────────────────────────
-
-fn render_tabs(frame: &mut Frame, state: &AppState, area: Rect, p: &Palette, narrow: bool) {
-    let tabs = &state.tabs;
-    let sel_idx = tabs
+    let elapsed: Vec<String> = app
+        .rows
         .iter()
-        .position(|t| t == &state.current_category)
-        .unwrap_or(0);
-    let titles: Vec<Line> = tabs
-        .iter()
-        .map(|tab| {
-            let label = if narrow {
-                tab_label(tab, narrow).to_string()
+        .map(|row| {
+            if row.kind == RowKind::Pane
+                && row.provider.is_some_and(AgentProvider::supports_timing)
+                && row.agents == [AgentStatus::Working]
+            {
+                row.working_since_ms
+                    .and_then(|start| now_ms.checked_sub(start))
+                    .map(|ms| format_duration(ms / 1000))
+                    .unwrap_or_default()
             } else {
-                format!(" {} ", tab_label(tab, narrow))
-            };
-            Line::from(Span::styled(label, Style::default().fg(p.accent)))
+                String::new()
+            }
         })
         .collect();
-    let divider = if narrow {
-        Span::raw(" ").style(Style::default().fg(p.overlay0))
-    } else {
-        Span::raw("|").style(Style::default().fg(p.overlay0))
-    };
-    frame.render_widget(
-        Tabs::new(titles)
-            .block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(p.surface_dim)),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(p.surface_dim)
-                    .bg(p.accent)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .divider(divider)
-            .select(sel_idx),
-        area,
-    );
-}
-
-fn render_search(
-    frame: &mut Frame,
-    state: &AppState,
-    area: Rect,
-    matched: usize,
-    total: usize,
-    p: &Palette,
-) {
-    let prefix = " > ";
-    // In the All tab a filter prefix (`cmd `, `.`, …) is lifted out of the
-    // query and shown as a badge chip; the rest is the live search text.
-    let (filter, rest) = if state.current_category == CategoryTab::All {
-        OthersFilter::parse(&state.search_query)
-    } else {
-        (None, state.search_query.as_str())
-    };
-    let is_empty = rest.is_empty();
-    let text = if is_empty { "type to filter..." } else { rest };
-    let count_str = if is_empty {
-        format!("{}", total)
-    } else {
-        format!("{}/{}", matched, total)
-    };
-
-    let text_style = if is_empty {
-        Style::default().fg(p.overlay0)
-    } else {
-        Style::default().fg(p.text)
-    };
-    let badge_w = match filter {
-        Some(f) => f.label().len() + 4, // chip padding (" x ") + separator space
-        None => 0,
-    };
-    let padding_right = 2;
-    let pad = area.width.saturating_sub(
-        (prefix.len() + badge_w + text.len() + count_str.len() + padding_right) as u16,
-    ) as usize;
-
-    let mut spans = vec![Span::styled(prefix, text_style)];
-    if let Some(f) = filter {
-        spans.push(filter_chip(f, p));
-        spans.push(Span::raw(" "));
-    }
-    spans.push(Span::styled(text.to_string(), text_style));
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(count_str, Style::default().fg(p.overlay0)));
-    frame.render_widget(
-        Paragraph::new(Line::from(spans))
-            .block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(p.surface0)),
-            )
-            .style(Style::default().fg(p.text)),
-        area,
-    );
-}
-
-/// Colored chip shown left of the input while an All filter is active.
-fn filter_chip(f: OthersFilter, p: &Palette) -> Span<'static> {
-    let color = match f {
-        OthersFilter::Content => p.accent,
-        OthersFilter::Source(src) => source_color(&src, p),
-        OthersFilter::Workspace => p.peach,
-        OthersFilter::Tab => p.red,
-        OthersFilter::Pane => p.blue,
-    };
-    Span::styled(
-        format!(" {} ", f.label()),
-        Style::default()
-            .fg(p.surface_dim)
-            .bg(color)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-fn render_column_header(
-    frame: &mut Frame,
-    category: &CategoryTab,
-    area: Rect,
-    p: &Palette,
-    narrow: bool,
-) {
-    if area.width < 10 || narrow {
-        return;
-    }
-    let style = Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD);
-    let (labels, col_start, constraints): (&[&str], usize, &[Constraint]) = match category {
-        CategoryTab::Panes => (&["Pane", "Tab", "Workspace", "Agent"], 1, &col_layout::PANE),
-        CategoryTab::Tabs => (&["Tab", "Workspace", "Agent"], 1, &col_layout::TAB),
-        CategoryTab::Agents => (&["Agent", "Tab", "Workspace"], 2, &col_layout::AGENT),
-        CategoryTab::Workspaces => (&["Workspace", "Agent"], 1, &col_layout::WORKSPACE),
-        CategoryTab::All => (
-            &["Type", "Detail", "Context", "Tab", "Workspace"],
-            1,
-            &col_layout::OTHER,
-        ),
-    };
-    let cols = Layout::horizontal(constraints)
-        .flex(Flex::Start)
-        .split(Rect::new(0, 0, area.width, 1));
-    let mut spans: Vec<Span> = vec![Span::raw(
-        " ".repeat(
-            cols[..col_start]
-                .iter()
-                .map(|c| c.width as usize)
-                .sum::<usize>(),
-        ),
-    )];
-    let label_count = labels.len();
-    for (i, &label) in labels.iter().enumerate() {
-        let cw = cols[col_start + i].width as usize;
-        let align_right = *category == CategoryTab::Panes && i == label_count - 1;
-        let truncated = truncate_to(label, cw);
-        let w = UnicodeWidthStr::width(truncated.as_str());
-        let pad = cw.saturating_sub(w);
-        if align_right {
-            if pad > 0 {
-                spans.push(Span::raw(" ".repeat(pad)));
-            }
-            spans.push(Span::styled(truncated, style));
-        } else {
-            spans.push(Span::styled(truncated, style));
-            if pad > 0 {
-                spans.push(Span::raw(" ".repeat(pad)));
-            }
-        }
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(p.surface_dim)),
-        area,
-    );
-}
-
-fn render_list(
-    frame: &mut Frame,
-    items: &[DisplayItem],
-    selected_index: usize,
-    search_query: &str,
-    tick: u32,
-    area: Rect,
-    p: &Palette,
-) {
-    let row_width = area.width as usize;
-    let ctx = RowCtx {
-        sel: false,
-        rw: row_width,
-        query: search_query,
-        tick,
-        p,
-    };
-    let list_items: Vec<ListItem> = items
+    // Keep complete timers with their bubble, leaving at least one name cell.
+    let time_width = elapsed
         .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let sel = i == selected_index;
-            let row_ctx = RowCtx {
-                sel,
-                rw: ctx.rw,
-                query: ctx.query,
-                tick: ctx.tick,
-                p: ctx.p,
-            };
-            match item {
-                DisplayItem::Workspace {
-                    name,
-                    agent_statuses,
-                    ..
-                } => row_workspace(i, name, agent_statuses, &row_ctx),
-                DisplayItem::Tab {
-                    name,
-                    workspace,
-                    agent_statuses,
-                    ..
-                } => row_tab(i, name, workspace, agent_statuses, &row_ctx),
-                DisplayItem::Agent {
-                    agent_id,
-                    status,
-                    tab,
-                    workspace,
-                    ..
-                } => row_agent(i, agent_id, status, tab, workspace, &row_ctx),
-DisplayItem::Pane {
-                pane_name,
-                workspace,
-                tab,
-                agent_id,
-                status,
-                ..
-            } => row_pane(i, pane_name, workspace, tab, agent_id, status, &row_ctx),
-            DisplayItem::Other {
-                source,
-                detail,
-                context,
-                tab,
-                workspace,
-                ..
-            } => row_other(i, source, detail, context, tab, workspace, &row_ctx),
-        }
-        })
-        .collect();
-    let visible_rows = area.height as usize;
-    let scroll_offset = if visible_rows == 0 || items.len() <= visible_rows {
+        .filter(|time| !time.is_empty())
+        .map(|time| time.len() + 4)
+        .filter(|&width| width < area.width as usize)
+        .max()
+        .unwrap_or(0);
+    let status_width = app
+        .rows
+        .iter()
+        .map(|row| row.agents.len().saturating_mul(2))
+        .max()
+        .unwrap_or(0)
+        .max(time_width)
+        .min((area.width as usize).saturating_sub(8).max(time_width)) as u16;
+    let mut widths = vec![Constraint::Fill(1)];
+    if status_width > 0 {
+        widths.push(Constraint::Length(status_width));
+    }
+    let spacing = if status_width > 0 {
+        2.min(area.width.saturating_sub(status_width + 1))
+    } else {
         0
-    } else {
-        let max_offset = items.len() - visible_rows;
-        let target = selected_index.saturating_sub(visible_rows / 2);
-        target.min(max_offset)
     };
-    let mut list_state = ListState::default();
-    list_state.select(Some(selected_index));
-    *list_state.offset_mut() = scroll_offset;
-    frame.render_stateful_widget(
-        List::new(list_items)
-            .block(Block::default().borders(Borders::NONE))
-            .highlight_style(Style::default()),
-        area,
-        &mut list_state,
-    );
-}
-
-fn render_status_bar(frame: &mut Frame, area: Rect, p: &Palette, narrow: bool, kb: &Keybindings) {
-    fn first(v: &[String]) -> &str {
-        v.first().map(|s| s.as_str()).unwrap_or("?")
-    }
-    let hints: Vec<Span> = if narrow {
-        vec![
+    let name_width = area.width.saturating_sub(status_width + spacing);
+    let mut rows = Vec::new();
+    let mut selected = app.selected;
+    for (i, (row, elapsed)) in app.rows.iter().zip(&elapsed).enumerate() {
+        if i > 0 && row.kind == RowKind::Workspace && row.depth == 0 {
+            rows.push(TableRow::new([Cell::from("─".repeat(area.width as usize))
+                .style(Style::default().fg(palette.muted))
+                .column_span(widths.len() as u16)]));
+            if i <= app.selected {
+                selected += 1;
+            }
+        }
+        let current_pane = row.kind == RowKind::Pane && row.target.is_none();
+        let mut name = vec![Span::styled(
+            format!(" {}", row.prefix),
+            Style::default().fg(palette.muted),
+        )];
+        let (glyph, color) = match row.kind {
+            RowKind::Workspace => (" ", palette.blue),
+            RowKind::Worktree => (" ", palette.mauve),
+            RowKind::Tab => (" ", palette.yellow),
+            RowKind::Pane => match row.provider {
+                Some(AgentProvider::Codex) => ("֎ ", Color::Indexed(6)),
+                Some(AgentProvider::Claude) => ("✳ ", palette.peach),
+                Some(AgentProvider::Other) => ("◇ ", palette.teal),
+                None => (" ", palette.text),
+            },
+        };
+        name.push(Span::styled(
+            glyph,
+            Style::default().fg(if current_pane { palette.muted } else { color }),
+        ));
+        let label_style = if current_pane {
+            Style::default().fg(palette.muted)
+        } else if row.depth == 0 {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let mut offset = 0;
+        let label = Span::raw(row.name.as_str());
+        for grapheme in label.styled_graphemes(Style::default()) {
+            let end = offset + grapheme.symbol.chars().count();
+            let match_index = row.matches.partition_point(|&i| i < offset);
+            let matched = row.matches.get(match_index).is_some_and(|&i| i < end);
+            let text_style = if !current_pane && matched {
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                label_style
+            };
+            name.push(Span::styled(grapheme.symbol.to_owned(), text_style));
+            offset = end;
+        }
+        if row.has_children && !row.expanded {
+            name.push(Span::styled(" [+]", Style::default().fg(palette.muted)));
+        }
+        let mut status = Vec::new();
+        if !elapsed.is_empty() && elapsed.len() + 4 <= status_width as usize {
+            status.push(Span::styled(
+                elapsed.as_str(),
+                Style::default().fg(if current_pane {
+                    palette.muted
+                } else {
+                    palette.subtext
+                }),
+            ));
+            status.push(Span::raw("  "));
+        }
+        status.extend(row.agents.iter().map(|status| {
+            let color = match status {
+                AgentStatus::Blocked => palette.red,
+                AgentStatus::Working => palette.yellow,
+                AgentStatus::Done => palette.blue,
+                AgentStatus::Idle => palette.green,
+                AgentStatus::Unknown => palette.muted,
+            };
             Span::styled(
-                format!(" {}", first(&kb.next_category)),
-                Style::default().fg(p.accent),
-            ),
-            Span::styled("↔", Style::default().fg(p.overlay0)),
-            Span::styled(
-                format!(" {}", first(&kb.previous_category)),
-                Style::default().fg(p.accent),
-            ),
-            Span::styled("↔", Style::default().fg(p.overlay0)),
-            Span::styled(
-                format!(" {}", first(&kb.select)),
-                Style::default().fg(p.accent),
-            ),
-            Span::styled("Go", Style::default().fg(p.overlay0)),
-            Span::styled(
-                format!(" {}", first(&kb.dismiss)),
-                Style::default().fg(p.accent),
-            ),
-            Span::styled("✕", Style::default().fg(p.overlay0)),
-        ]
-    } else {
-        vec![
-            Span::styled(
-                format!("   {}", first(&kb.next_category)),
-                Style::default().fg(p.accent),
-            ),
-            Span::styled(" Next", Style::default().fg(p.overlay0)),
-            Span::styled(
-                format!("  {}", first(&kb.previous_category)),
-                Style::default().fg(p.accent),
-            ),
-            Span::styled(" Prev", Style::default().fg(p.overlay0)),
-            Span::styled(
-                format!("  {}", first(&kb.move_up)),
-                Style::default().fg(p.accent),
-            ),
-            Span::styled(" Move", Style::default().fg(p.overlay0)),
-            Span::styled(
-                format!("  {}", first(&kb.select)),
-                Style::default().fg(p.accent),
-            ),
-            Span::styled(" Focus", Style::default().fg(p.overlay0)),
-            Span::styled(
-                format!("  {}", first(&kb.dismiss)),
-                Style::default().fg(p.accent),
-            ),
-            Span::styled(" Close", Style::default().fg(p.overlay0)),
-        ]
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(hints))
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(Style::default().fg(p.surface0)),
+                if *status == AgentStatus::Idle {
+                    " "
+                } else {
+                    "● "
+                },
+                Style::default().fg(color),
             )
-            .style(Style::default().fg(p.overlay0)),
-        area,
-    );
-}
-
-// ── Flex column helper ──────────────────────────────────────────────────────
-
-/// Build styled spans for a single flex column.
-/// Truncates text to `width`, applies search highlighting,
-/// pads right (left-align) or left (right-align).
-///
-/// Left-aligned columns reserve their last char as a gutter, so a column
-/// whose content fills the whole allocation never touches the next one.
-fn flex_col(
-    text: &str,
-    width: usize,
-    query: &str,
-    base_style: Style,
-    hl_style: Style,
-    align_right: bool,
-) -> Vec<Span<'static>> {
-    if width == 0 {
-        return vec![];
-    }
-    let (content_w, gutter) = if align_right {
-        (width, 0)
-    } else {
-        (width.saturating_sub(1), 1)
-    };
-    let display = truncate_to(text, content_w);
-    let mut spans = highlight_text(&display, query, base_style, hl_style);
-    let display_w = UnicodeWidthStr::width(display.as_str());
-    let pad = content_w.saturating_sub(display_w);
-    if pad > 0 {
-        if align_right {
-            spans.insert(0, Span::raw(" ".repeat(pad)));
-        } else {
-            spans.push(Span::raw(" ".repeat(pad)));
+        }));
+        let mut cells = vec![Cell::from(ellipsize(
+            Line::from(name),
+            name_width as usize,
+            label_style,
+        ))];
+        if status_width > 0 {
+            cells.push(Cell::from(Line::from(status).right_aligned()));
         }
+        rows.push(TableRow::new(cells));
     }
-    if gutter > 0 {
-        spans.push(Span::raw(" ".repeat(gutter)));
-    }
-    spans
+    let table = Table::new(rows, widths)
+        .column_spacing(spacing)
+        .style(style)
+        .row_highlight_style(Style::default().bg(palette.selection));
+    let mut state = TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, chunks[3], &mut state);
 }
-
-// ── Column layout profiles ───────────────────────────────────────────────────
-
-mod col_layout {
-    use ratatui::layout::Constraint;
-
-    pub const IDX: Constraint = Constraint::Length(4);
-    pub const ICON: Constraint = Constraint::Length(2);
-    pub const PANE: [Constraint; 5] = [
-        IDX,
-        Constraint::Percentage(28),
-        Constraint::Percentage(22),
-        Constraint::Percentage(28),
-        Constraint::Percentage(22),
-    ];
-    pub const DOTS: Constraint = Constraint::Length(8);
-    pub const TAB: [Constraint; 4] = [
-        IDX,
-        Constraint::Percentage(45),
-        Constraint::Percentage(45),
-        DOTS,
-    ];
-    pub const AGENT: [Constraint; 5] = [
-        IDX,
-        ICON,
-        Constraint::Percentage(32),
-        Constraint::Percentage(32),
-        Constraint::Percentage(36),
-    ];
-    pub const WORKSPACE: [Constraint; 3] = [IDX, Constraint::Fill(1), DOTS];
-    pub const OTHER: [Constraint; 6] = [
-        IDX,
-        Constraint::Length(6),
-        Constraint::Percentage(26),
-        Constraint::Percentage(26),
-        Constraint::Percentage(16),
-        Constraint::Percentage(24),
-    ];
-}
-
-fn col_spans(text: &str, col: &Rect, query: &str, base: Style, hl: Style) -> Vec<Span<'static>> {
-    flex_col(text, col.width as usize, query, base, hl, false)
-}
-
-// ── Row builders ────────────────────────────────────────────────────────────
-
-struct RowCtx<'a> {
-    sel: bool,
-    rw: usize,
-    query: &'a str,
-    tick: u32,
-    p: &'a Palette,
-}
-
-fn row_workspace(i: usize, name: &str, a: &[AgentStatus], ctx: &RowCtx) -> ListItem<'static> {
-    let ns = name_style(ctx.sel, ctx.p);
-    let hl = hl_style(ctx.sel, ctx.p);
-
-    let rw = ctx.rw as u16;
-    let cols = Layout::horizontal(col_layout::WORKSPACE)
-        .flex(Flex::Start)
-        .split(Rect::new(0, 0, rw, 1));
-
-    let mut sp = vec![num_span(i, ctx.sel, ctx.p)];
-    match name.split_once(WORKTREE_SEP) {
-        Some((repo, wt)) => {
-            let total = cols[1].width as usize;
-            let repo_w = (UnicodeWidthStr::width(repo) + 1).min(total);
-            sp.extend(flex_col(repo, repo_w, ctx.query, ns, hl, false));
-            let wt = format!("{}{}", WORKTREE_SEP.trim_start(), wt);
-            let ws = ctx_style(ctx.sel, ctx.p);
-            sp.extend(flex_col(&wt, total - repo_w, ctx.query, ws, hl, false));
-        }
-        None => sp.extend(col_spans(name, &cols[1], ctx.query, ns, hl)),
-    }
-    let dots_w = a.len() * 2;
-    let dots_col_w = cols[2].width as usize;
-    let pad = dots_col_w.saturating_sub(dots_w);
-    if !a.is_empty() {
-        for st in a {
-            let (dot, dot_style) = state_dot(st, ctx.p);
-            sp.push(Span::styled(format!(" {dot}"), dot_style));
-        }
-    }
-    if pad > 0 {
-        sp.push(Span::raw(" ".repeat(pad)));
-    }
-    ListItem::new(Line::from(sp)).style(row_sel_style(ctx.sel, ctx.p))
-}
-
-fn row_tab(i: usize, name: &str, ws: &str, a: &[AgentStatus], ctx: &RowCtx) -> ListItem<'static> {
-    let cs = ctx_style(ctx.sel, ctx.p);
-    let hl = hl_style(ctx.sel, ctx.p);
-    let ns = name_style(ctx.sel, ctx.p);
-
-    let rw = ctx.rw as u16;
-    let cols = Layout::horizontal(col_layout::TAB)
-        .flex(Flex::Start)
-        .split(Rect::new(0, 0, rw, 1));
-
-    let mut sp = vec![num_span(i, ctx.sel, ctx.p)];
-    sp.extend(col_spans(name, &cols[1], ctx.query, ns, hl));
-    sp.extend(col_spans(ws, &cols[2], ctx.query, cs, hl));
-    let dots_w = a.len() * 2;
-    let dots_col_w = cols[3].width as usize;
-    let pad = dots_col_w.saturating_sub(dots_w);
-    if !a.is_empty() {
-        for st in a {
-            let (dot, dot_style) = state_dot(st, ctx.p);
-            sp.push(Span::styled(format!(" {dot}"), dot_style));
-        }
-    }
-    if pad > 0 {
-        sp.push(Span::raw(" ".repeat(pad)));
-    }
-    ListItem::new(Line::from(sp)).style(row_sel_style(ctx.sel, ctx.p))
-}
-
-fn row_agent(
-    i: usize,
-    aid: &str,
-    s: &AgentStatus,
-    tab: &str,
-    ws: &str,
-    ctx: &RowCtx,
-) -> ListItem<'static> {
-    let cs = ctx_style(ctx.sel, ctx.p);
-    let hl = hl_style(ctx.sel, ctx.p);
-    let ns = name_style(ctx.sel, ctx.p);
-    let (icon, icon_style) = agent_icon(s, ctx.tick, ctx.p);
-
-    let rw = ctx.rw as u16;
-    let cols = Layout::horizontal(col_layout::AGENT)
-        .flex(Flex::Start)
-        .split(Rect::new(0, 0, rw, 1));
-
-    let mut sp = vec![num_span(i, ctx.sel, ctx.p)];
-    sp.push(Span::styled(format!("{} ", icon), icon_style));
-    sp.extend(col_spans(aid, &cols[2], ctx.query, ns, hl));
-    sp.extend(col_spans(tab, &cols[3], ctx.query, cs, hl));
-    sp.extend(col_spans(ws, &cols[4], ctx.query, cs, hl));
-    ListItem::new(Line::from(sp)).style(row_sel_style(ctx.sel, ctx.p))
-}
-
-fn row_pane(
-    i: usize,
-    pn: &str,
-    ws: &str,
-    tab: &str,
-    aid: &Option<String>,
-    s: &AgentStatus,
-    ctx: &RowCtx,
-) -> ListItem<'static> {
-    let cs = ctx_style(ctx.sel, ctx.p);
-    let hl = hl_style(ctx.sel, ctx.p);
-    let ns = if pn == "untitled" {
-        if ctx.sel {
-            Style::default().fg(ctx.p.overlay1)
-        } else {
-            Style::default().fg(ctx.p.overlay0)
-        }
-    } else {
-        name_style(ctx.sel, ctx.p)
-    };
-
-    let rw = ctx.rw as u16;
-    let cols = Layout::horizontal(col_layout::PANE)
-        .flex(Flex::Start)
-        .split(Rect::new(0, 0, rw, 1));
-
-    let mut sp = vec![num_span(i, ctx.sel, ctx.p)];
-    sp.extend(col_spans(pn, &cols[1], ctx.query, ns, hl));
-    sp.extend(col_spans(tab, &cols[2], ctx.query, cs, hl));
-    sp.extend(col_spans(ws, &cols[3], ctx.query, cs, hl));
-
-    if let Some(a) = aid {
-        let (icon, icon_style) = agent_icon(s, ctx.tick, ctx.p);
-        let agent_style = Style::default().fg(icon_style.fg.unwrap_or(ctx.p.overlay0));
-        let col_w = cols[4].width as usize;
-        let icon_w = UnicodeWidthStr::width(icon);
-        let name_w = col_w.saturating_sub(icon_w + 1);
-        let display = truncate_to(a, name_w);
-        let content_w = icon_w + 1 + UnicodeWidthStr::width(display.as_str());
-        let pad = col_w.saturating_sub(content_w);
-        if pad > 0 {
-            sp.push(Span::raw(" ".repeat(pad)));
-        }
-        sp.push(Span::styled(format!("{} ", icon), icon_style));
-        sp.extend(highlight_text(&display, ctx.query, agent_style, hl));
-    }
-    ListItem::new(Line::from(sp)).style(row_sel_style(ctx.sel, ctx.p))
-}
-
-/// Per-source color so the Type column is scannable at a glance.
-fn source_color(source: &OtherSource, p: &Palette) -> Color {
-    match source {
-        OtherSource::Ssh => p.teal,
-        OtherSource::Cmd => p.yellow,
-        OtherSource::File => p.mauve,
-        OtherSource::Terminal => p.blue,
-        OtherSource::Cwd => p.green,
-    }
-}
-
-fn source_style(source: &OtherSource, p: &Palette) -> Style {
-    Style::default()
-        .fg(source_color(source, p))
-        .add_modifier(Modifier::BOLD)
-}
-
-fn row_other(
-    i: usize,
-    source: &OtherSource,
-    detail: &str,
-    context: &str,
-    tab: &str,
-    ws: &str,
-    ctx: &RowCtx,
-) -> ListItem<'static> {
-    let cs = ctx_style(ctx.sel, ctx.p);
-    let hl = hl_style(ctx.sel, ctx.p);
-    let ns = name_style(ctx.sel, ctx.p);
-
-    let rw = ctx.rw as u16;
-    let cols = Layout::horizontal(col_layout::OTHER)
-        .flex(Flex::Start)
-        .split(Rect::new(0, 0, rw, 1));
-
-    let mut sp = vec![num_span(i, ctx.sel, ctx.p)];
-
-    // Type column (fixed width, right-side type reads like a tag).
-    let type_col_w = cols[1].width as usize;
-    let type_text = source.label();
-    let tw = UnicodeWidthStr::width(type_text);
-    let pad = type_col_w.saturating_sub(tw + 1) + 1; // 1-char gutter
-    sp.push(Span::styled(type_text.to_string(), source_style(source, ctx.p)));
-    sp.push(Span::raw(" ".repeat(pad)));
-
-    sp.extend(col_spans(detail, &cols[2], ctx.query, ns, hl));
-    // Context (file path etc.): front-truncate so the tail — basename and
-    // `:line` — stays visible; `-` ("no context") sits dimmer.
-    if context == "-" {
-        let dim = Style::default().fg(if ctx.sel { ctx.p.text } else { ctx.p.overlay1 });
-        sp.extend(col_spans(context, &cols[3], "", dim, hl));
-    } else {
-        let display = truncate_front(context, cols[3].width.saturating_sub(1) as usize);
-        sp.extend(col_spans(&display, &cols[3], ctx.query, cs, hl));
-    }
-    sp.extend(col_spans(tab, &cols[4], ctx.query, cs, hl));
-    sp.extend(col_spans(ws, &cols[5], ctx.query, cs, hl));
-    ListItem::new(Line::from(sp)).style(row_sel_style(ctx.sel, ctx.p))
-}
-// min_terminal_size, content_rect, truncate_to, tab_label, centered_rect
-// are imported via `use crate::format::*;` at the top of this file.
 
 #[cfg(test)]
-mod palette_tests {
+mod tree_tests {
     use super::*;
+    use crate::{
+        app::AppState,
+        models::{ActiveLocation, History, Keybindings},
+        test_helpers::snapshot,
+        theme::Palette,
+    };
+    use ratatui::style::Color;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn tree_y(app: &AppState, key: &str) -> u16 {
+        let index = app.rows.iter().position(|row| row.key == key).unwrap();
+        let dividers = app.rows[..=index]
+            .iter()
+            .skip(1)
+            .filter(|row| row.kind == RowKind::Workspace && row.depth == 0)
+            .count();
+        (2 + index + dividers) as u16
+    }
 
     #[test]
-    fn detects_light_theme_suffixes() {
-        for name in [
-            "one-light",
-            "catppuccin-latte",
-            "tokyonight-day",
-            "rose-pine-dawn",
-            "kanagawa-lotus",
-        ] {
-            assert!(is_light_theme(name), "{name} should be detected as light");
+    fn search_and_workspace_rules_use_guide_gray_without_dividing_worktrees() {
+        for (query, workspace_rules) in [("", 1), ("reviewer", 0)] {
+            let (_, buffer) = screen(55, 20, query);
+            for x in 0..55 {
+                assert_eq!(buffer[(x, 1)].symbol(), "─");
+                assert_eq!(buffer[(x, 1)].fg, Palette::default().muted);
+            }
+            let rules: Vec<_> = (2..20)
+                .filter(|&y| buffer[(0, y)].symbol() == "─")
+                .collect();
+            assert_eq!(rules.len(), workspace_rules);
+            if query.is_empty() {
+                assert_eq!(rules, vec![10]);
+                for x in 0..55 {
+                    assert_eq!(buffer[(x, 10)].symbol(), "─");
+                    assert_eq!(buffer[(x, 10)].fg, Palette::default().muted);
+                }
+                assert_eq!(buffer[(4, 3)].symbol(), "");
+                assert_eq!(buffer[(1, 11)].symbol(), "");
+            }
+            for y in 2..20 {
+                assert_eq!(
+                    buffer[(47, y)].symbol(),
+                    if query.is_empty() && y == 10 {
+                        "─"
+                    } else {
+                        " "
+                    }
+                );
+            }
+            if query.is_empty() {
+                assert_eq!(buffer[(1, 4)].symbol(), "│");
+            }
         }
     }
 
     #[test]
-    fn detects_bare_light_value() {
-        assert!(is_light_theme("light"));
-        assert!(is_light_theme("  Light  "));
+    fn time_precedes_its_bubble_in_the_same_right_aligned_status_cell() {
+        let now = 100_000_000;
+        let mut data = snapshot();
+        data.workspaces[0].tabs[0].panes[0].working_since_ms = Some(now - 5000);
+        data.workspaces[1].tabs[0].panes[0].status = AgentStatus::Working;
+        data.workspaces[1].tabs[0].panes[0].working_since_ms = Some(now - 93_784_000);
+        let mut app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        app.toggle_all();
+        let palette =
+            Palette::from_config("[theme.custom]\noverlay0 = \"#888888\"\nsubtext0 = \"#a9b1d6\"");
+        let mut terminal = Terminal::new(TestBackend::new(65, 30)).unwrap();
+        terminal
+            .draw(|frame| render_at(frame, &app, &palette, now))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let notes_y = tree_y(&app, "pane:named-notes");
+        let review_y = tree_y(&app, "pane:named-review");
+        let name = |y| (0..48).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        let status = |y| {
+            (50..65)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert_eq!(name(notes_y).trim_end(), " │  ├─ ✳ notes");
+        assert_eq!(name(review_y).trim_end(), " │     └─ ֎ reviewer");
+        assert_eq!(status(notes_y).trim_start(), "5s  ● ");
+        assert_eq!(status(review_y), "1d 2h 3m 4s  ● ");
+        assert_eq!(buffer[(59, notes_y)].symbol(), "5");
+        assert_eq!(buffer[(59, notes_y)].fg, Color::Rgb(169, 177, 214));
+        assert_eq!(buffer[(9, notes_y)].fg, palette.text);
+        for y in [notes_y, review_y] {
+            assert_eq!(buffer[(63, y)].symbol(), "●");
+            assert_eq!(buffer[(63, y)].fg, palette.yellow);
+        }
+        assert_eq!(status(2).trim_start(), "● ●  ");
+        assert!((0..65).all(|x| buffer[(x, 1)].symbol() == "─"));
+        assert!((2..30).all(|y| buffer[(48, y)].symbol() != "│"));
     }
 
     #[test]
-    fn detects_light_case_insensitively() {
-        assert!(is_light_theme("One-Light"));
-        assert!(is_light_theme("Catppuccin-Latte"));
+    fn full_time_is_preserved_when_a_workspace_has_many_agent_bubbles() {
+        let now = 100_000_000;
+        let mut data = snapshot();
+        data.workspaces[0].tabs[0].panes[0].name = Some("long-title".repeat(30));
+        data.workspaces[0].tabs[0].panes[0].working_since_ms = Some(now - 93_784_000);
+        let extra = data.workspaces[0].tabs[0].panes[1].clone();
+        for i in 0..40 {
+            let mut pane = extra.clone();
+            pane.id = format!("extra-{i}");
+            data.workspaces[0].tabs[0].panes.push(pane);
+        }
+        let app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| render_at(frame, &app, &Palette::default(), now))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let y = tree_y(&app, "pane:named-notes");
+        assert_eq!(buffer[(5, y)].symbol(), "…");
+        let status: String = (45..60).map(|x| buffer[(x, y)].symbol()).collect();
+        assert_eq!(status, "1d 2h 3m 4s  ● ");
     }
 
     #[test]
-    fn rejects_dark_themes() {
-        for name in [
-            "dark",
-            "tokyonight",
-            "tokyonight-storm",
-            "catppuccin-mocha",
-            "one-dark",
-            "gruvbox",
-            "lightning",
-            "daylight-saving",
-        ] {
-            assert!(!is_light_theme(name), "{name} should not be light");
+    fn narrow_viewports_show_a_complete_time_or_omit_it_rather_than_cutting_it() {
+        let now = 100_000_000;
+        let mut data = snapshot();
+        data.workspaces[0].tabs[0].panes[0].working_since_ms = Some(now - 93_784_000);
+        let app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        for width in [1, 3, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+            terminal
+                .draw(|frame| render_at(frame, &app, &Palette::default(), now))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let y = tree_y(&app, "pane:named-notes");
+            let line: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+            if width >= 16 {
+                assert!(line.ends_with("1d 2h 3m 4s  ● "), "{width}: {line}");
+                let first = (0..width)
+                    .find(|&x| buffer[(x, y)].symbol() == "1")
+                    .unwrap();
+                assert_eq!(buffer[(first, y)].fg, Color::Gray);
+            } else {
+                assert!(!line.chars().any(|c| c.is_ascii_digit()), "{width}: {line}");
+            }
         }
     }
 
     #[test]
-    fn for_theme_picks_light_palette_for_light_names() {
-        let light = Palette::light();
-        let picked = Palette::for_theme(Some("one-light"));
-        assert_eq!(picked.text, light.text);
-        assert_eq!(picked.surface_dim, light.surface_dim);
+    fn separators_do_not_steal_selection_when_scrolling_to_a_workspace() {
+        let mut app = AppState::new(
+            snapshot(),
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        app.toggle_all();
+        app.selected = app.rows.iter().position(|row| row.name == "Other").unwrap();
+        let target = app.selected_target();
+        let palette = Palette::default();
+        let mut terminal = Terminal::new(TestBackend::new(55, 4)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &palette))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 2)].symbol(), "─");
+        assert_eq!(buffer[(0, 2)].bg, palette.background);
+        assert_eq!(buffer[(1, 3)].symbol(), "");
+        assert_eq!(buffer[(3, 3)].symbol(), "O");
+        assert_eq!(buffer[(3, 3)].bg, palette.selection);
+        assert_eq!(app.selected_target(), target);
+        assert_eq!(
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE
+            )),
+            crate::models::KeyAction::Select
+        );
     }
 
     #[test]
-    fn for_theme_defaults_to_dark_when_unknown_or_absent() {
-        let dark = Palette::dark();
-        assert_eq!(Palette::for_theme(None).text, dark.text);
-        assert_eq!(Palette::for_theme(Some("tokyonight")).text, dark.text);
+    fn green_status_uses_the_open_marker_and_all_status_colors_are_preserved() {
+        let palette = Palette::default();
+        for (status, symbol, color) in [
+            (AgentStatus::Idle, "", palette.green),
+            (AgentStatus::Done, "●", palette.blue),
+            (AgentStatus::Working, "●", palette.yellow),
+            (AgentStatus::Blocked, "●", palette.red),
+            (AgentStatus::Unknown, "●", palette.muted),
+        ] {
+            let mut data = snapshot();
+            data.workspaces[0].tabs[0].panes[0].status = status;
+            let app = AppState::new(
+                data,
+                &History::default(),
+                ActiveLocation::default(),
+                Keybindings::default(),
+            );
+            let mut terminal = Terminal::new(TestBackend::new(55, 20)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &app, &palette))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let y = tree_y(&app, "pane:named-notes");
+            assert_eq!(buffer[(53, y)].symbol(), symbol);
+            assert_eq!(buffer[(53, y)].fg, color);
+            let green: Vec<_> = (49..55)
+                .map(|x| &buffer[(x, 2)])
+                .filter(|cell| cell.fg == palette.green && !cell.symbol().trim().is_empty())
+                .collect();
+            assert!(!green.is_empty());
+            assert!(green.iter().all(|cell| cell.symbol() == ""));
+        }
+    }
+
+    #[test]
+    fn empty_and_error_states_keep_the_search_rule_and_empty_status_columns_are_hidden() {
+        let mut data = snapshot();
+        for pane in data
+            .workspaces
+            .iter_mut()
+            .flat_map(|w| &mut w.tabs)
+            .flat_map(|t| &mut t.panes)
+        {
+            pane.agent = None;
+        }
+        let mut app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        let palette = Palette::default();
+        let mut terminal = Terminal::new(TestBackend::new(55, 10)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &palette))
+            .unwrap();
+        assert!((0..55).all(|x| terminal.backend().buffer()[(x, 1)].symbol() == "─"));
+        assert_eq!(terminal.backend().buffer()[(53, 2)].symbol(), " ");
+        app.set_query("zzzzzz");
+        app.error = Some("Refresh failed".into());
+        terminal
+            .draw(|frame| render(frame, &app, &palette))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 1)].symbol(), "R");
+        assert!((0..55).all(|x| buffer[(x, 2)].symbol() == "─"));
+        assert_eq!(buffer[(1, 3)].symbol(), "N");
+    }
+
+    #[test]
+    fn ellipsis_uses_display_cells_and_never_splits_a_grapheme() {
+        for (text, width, expected) in [
+            ("abcd", 4, "abcd"),
+            ("abcde", 4, "abc…"),
+            ("abc", 0, ""),
+            ("abc", 1, "…"),
+            ("a界界", 4, "a界…"),
+            ("界界", 2, " …"),
+            ("e\u{301}xyz", 3, "e\u{301}x…"),
+            ("👩‍💻abc", 4, "👩‍💻a…"),
+        ] {
+            let line = ellipsize(Line::from(text), width, Style::default());
+            let result: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(result, expected);
+            assert!(line.width() <= width);
+        }
+    }
+
+    #[test]
+    fn every_row_kind_marks_truncation_before_timer_and_status_columns() {
+        let now = 100_000_000;
+        for with_timer in [false, true] {
+            let mut data = snapshot();
+            data.workspaces[0].name = "w".repeat(80);
+            data.workspaces[0].tabs[0].name = "t".repeat(80);
+            data.workspaces[0].tabs[0].panes[0].name = Some("p".repeat(80));
+            data.workspaces[1].name = "g".repeat(80);
+            if with_timer {
+                data.workspaces[0].tabs[0].panes[0].working_since_ms = Some(now - 93_784_000);
+            }
+            let mut app = AppState::new(
+                data,
+                &History::default(),
+                ActiveLocation::default(),
+                Keybindings::default(),
+            );
+            app.toggle_all();
+            let mut terminal = Terminal::new(TestBackend::new(55, 20)).unwrap();
+            terminal
+                .draw(|frame| render_at(frame, &app, &Palette::default(), now))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let notes_y = tree_y(&app, "pane:named-notes");
+            for kind in [
+                RowKind::Workspace,
+                RowKind::Worktree,
+                RowKind::Tab,
+                RowKind::Pane,
+            ] {
+                let row = app
+                    .rows
+                    .iter()
+                    .find(|row| row.kind == kind && row.name.len() == 80)
+                    .unwrap();
+                let y = tree_y(&app, &row.key);
+                let last = if with_timer { 37 } else { 46 };
+                assert_eq!(buffer[(last, y)].symbol(), "…", "{kind:?}");
+            }
+            assert_eq!(buffer[(53, notes_y)].symbol(), "●");
+            if with_timer {
+                let status: String = (40..55).map(|x| buffer[(x, notes_y)].symbol()).collect();
+                assert_eq!(status, "1d 2h 3m 4s  ● ");
+            }
+        }
+    }
+
+    #[test]
+    fn names_that_fit_exactly_do_not_get_an_ellipsis() {
+        for (length, expected_last) in [(43, " "), (44, "w"), (45, "…")] {
+            let mut data = snapshot();
+            data.workspaces[0].name = "w".repeat(length);
+            let app = AppState::new(
+                data,
+                &History::default(),
+                ActiveLocation::default(),
+                Keybindings::default(),
+            );
+            let mut terminal = Terminal::new(TestBackend::new(55, 20)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &app, &Palette::default()))
+                .unwrap();
+            assert_eq!(terminal.backend().buffer()[(46, 2)].symbol(), expected_last);
+        }
+    }
+
+    #[test]
+    fn current_agent_icon_name_search_matches_and_timer_are_gray_but_its_bubble_keeps_its_color() {
+        let mut data = snapshot();
+        data.workspaces[0].tabs[0].panes[0].working_since_ms = Some(10_000);
+        data.workspaces[0].tabs[0].panes[0].name = Some("notes ".repeat(20));
+        let mut app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation {
+                workspace_id: Some("project".into()),
+                tab_id: Some("editor".into()),
+                pane_id: Some("named-notes".into()),
+            },
+            Keybindings::default(),
+        );
+        app.set_query("notes");
+        let palette =
+            Palette::from_config("[theme.custom]\noverlay0 = \"#888888\"\nyellow = \"#ffcc00\"");
+        let mut terminal = Terminal::new(TestBackend::new(55, 20)).unwrap();
+        terminal
+            .draw(|frame| render_at(frame, &app, &palette, 15_000))
+            .unwrap();
+        let y = app
+            .rows
+            .iter()
+            .position(|r| r.name.starts_with("notes"))
+            .unwrap() as u16
+            + 2;
+        let buffer = terminal.backend().buffer();
+        let mut saw_timer = false;
+        for x in 0..55 {
+            let cell = &buffer[(x, y)];
+            if cell.symbol() == "●" {
+                assert_eq!(cell.fg, palette.yellow);
+            } else if !cell.symbol().trim().is_empty() {
+                assert_eq!(cell.fg, palette.muted, "{}", cell.symbol());
+            }
+            saw_timer |= cell.symbol() == "5";
+        }
+        assert!(saw_timer);
+        assert_eq!(buffer[(46, y)].symbol(), "…");
+        assert_eq!(buffer[(49, y)].symbol(), "5");
+        assert_eq!(buffer[(53, y)].symbol(), "●");
+    }
+
+    #[test]
+    fn working_duration_omits_zero_units_and_padding() {
+        for (seconds, expected) in [
+            (0, ""),
+            (5, "5s"),
+            (60, "1m"),
+            (65, "1m 5s"),
+            (3600, "1h"),
+            (3605, "1h 5s"),
+            (86400, "1d"),
+            (93784, "1d 2h 3m 4s"),
+            (8640005, "100d 5s"),
+        ] {
+            assert_eq!(format_duration(seconds), expected);
+        }
+    }
+
+    #[test]
+    fn status_times_remain_whole_while_names_shorten_and_tick_without_a_snapshot_refresh() {
+        let now = 100_000_000;
+        let mut data = snapshot();
+        data.workspaces[0].tabs[0].panes[0].working_since_ms = Some(now - 5000);
+        data.workspaces[0].tabs[0].panes[0].name = Some("notes 模型 café ".repeat(30));
+        data.workspaces[1].tabs[0].panes[0].status = AgentStatus::Working;
+        data.workspaces[1].tabs[0].panes[0].working_since_ms = Some(now - 93_784_000);
+        let mut app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        app.toggle_all();
+        let notes_y = tree_y(&app, "pane:named-notes");
+        let review_y = tree_y(&app, "pane:named-review");
+        let mut terminal = Terminal::new(TestBackend::new(55, 20)).unwrap();
+        for (time, short, long) in [
+            (now, "5s", "1d 2h 3m 4s"),
+            (now + 1000, "6s", "1d 2h 3m 5s"),
+        ] {
+            terminal
+                .draw(|frame| render_at(frame, &app, &Palette::default(), time))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let name = |y| (0..38).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+            let status = |y| {
+                (40..55)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            };
+            assert!(name(notes_y).ends_with('…'));
+            assert!(name(review_y).trim_end().ends_with("reviewer"));
+            assert_eq!(status(notes_y).trim_start(), format!("{short}  ● "));
+            assert_eq!(status(review_y), format!("{long}  ● "));
+            for y in (2..12).filter(|&y| y != notes_y && y != review_y) {
+                assert!(!status(y).chars().any(|c| c.is_ascii_digit()));
+            }
+            assert_eq!(buffer[(53, notes_y)].symbol(), "●");
+            assert_eq!(buffer[(53, review_y)].symbol(), "●");
+        }
+        app.set_query("notes");
+        terminal
+            .draw(|frame| render_at(frame, &app, &Palette::default(), now))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("5s"));
+        for width in [1, 3, 8, 20] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 4)).unwrap();
+            terminal
+                .draw(|frame| render_at(frame, &app, &Palette::default(), now))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn timers_hide_unknown_zero_future_unsupported_and_nonworking_durations() {
+        let now = 10_000;
+        for (agent, status, start) in [
+            ("codex", AgentStatus::Working, None),
+            ("claude", AgentStatus::Working, Some(now)),
+            ("codex", AgentStatus::Working, Some(now + 1000)),
+            ("other", AgentStatus::Working, Some(1)),
+            ("", AgentStatus::Working, Some(1)),
+            ("claude", AgentStatus::Idle, Some(1)),
+            ("claude", AgentStatus::Done, Some(1)),
+            ("codex", AgentStatus::Blocked, Some(1)),
+            ("codex", AgentStatus::Unknown, Some(1)),
+        ] {
+            let mut data = snapshot();
+            let pane = &mut data.workspaces[0].tabs[0].panes[0];
+            pane.agent = Some(agent.into());
+            pane.status = status;
+            pane.working_since_ms = start;
+            let mut app = AppState::new(
+                data,
+                &History::default(),
+                ActiveLocation::default(),
+                Keybindings::default(),
+            );
+            app.toggle_all();
+            let mut terminal = Terminal::new(TestBackend::new(55, 20)).unwrap();
+            terminal
+                .draw(|frame| render_at(frame, &app, &Palette::default(), now))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(
+                !text.chars().any(|c| c.is_ascii_digit()),
+                "{agent:?} {status:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_icons_replace_the_pane_icon_and_leave_no_provider_column() {
+        let mut data = snapshot();
+        data.workspaces[0].tabs[0].panes[0].name = Some("n".repeat(60));
+        let mut app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        app.toggle_all();
+        let mut terminal = Terminal::new(TestBackend::new(45, 20)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &Palette::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let notes_y = tree_y(&app, "pane:named-notes");
+        let review_y = tree_y(&app, "pane:named-review");
+        assert_eq!(buffer[(7, notes_y)].symbol(), "✳");
+        assert_eq!(buffer[(10, review_y)].symbol(), "֎");
+        assert!((9..36).all(|x| buffer[(x, notes_y)].symbol() == "n"));
+        assert_eq!(buffer[(36, notes_y)].symbol(), "…");
+        for y in [notes_y, review_y] {
+            assert_eq!(buffer[(43, y)].symbol(), "●");
+        }
+        assert_eq!(buffer[(1, 2)].symbol(), "");
+        assert_eq!(buffer[(4, 6)].symbol(), "");
+        assert_eq!(buffer[(4, 3)].symbol(), "");
+    }
+
+    #[test]
+    fn pane_provider_icons_distinguish_known_other_and_absent_agents() {
+        for (agent, expected, color) in [
+            (Some("codex"), "֎", Color::Indexed(6)),
+            (Some("claude"), "✳", Color::LightRed),
+            (Some(" CODEX "), "֎", Color::Indexed(6)),
+            (Some("Claude"), "✳", Color::LightRed),
+            (Some("other"), "◇", Color::Cyan),
+            (None, "", Color::Reset),
+            (Some(" \t"), "", Color::Reset),
+        ] {
+            let mut data = snapshot();
+            data.workspaces[0].tabs[0].panes[0].agent = agent.map(str::to_owned);
+            let mut app = AppState::new(
+                data,
+                &History::default(),
+                ActiveLocation::default(),
+                Keybindings::default(),
+            );
+            app.toggle_all();
+            let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &app, &Palette::default()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let y = tree_y(&app, "pane:named-notes");
+            let icons: Vec<_> = (0..64)
+                .map(|x| buffer[(x, y)].symbol())
+                .filter(|symbol| ["֎", "✳", "◇", ""].contains(symbol))
+                .collect();
+            assert_eq!(icons, vec![expected], "{agent:?}");
+            assert_eq!(buffer[(7, y)].symbol(), expected);
+            assert_eq!(buffer[(7, y)].fg, color);
+            assert_eq!(buffer[(62, y)].symbol() == "●", expected != "");
+        }
+    }
+
+    #[test]
+    fn icon_colors_follow_custom_palette_without_recoloring_names_connectors_or_bubbles() {
+        let palette = Palette::from_config(
+            r##"[theme.custom]
+blue = "#112233"
+mauve = "#223344"
+yellow = "#334455"
+green = "#445566"
+peach = "#556677"
+teal = "#667788"
+text = "#778899"
+overlay0 = "#8899aa"
+"##,
+        );
+        for (agent, icon, color) in [
+            (Some("codex"), "֎", Color::Indexed(6)),
+            (Some("claude"), "✳", Color::Rgb(85, 102, 119)),
+            (Some("other"), "◇", Color::Rgb(102, 119, 136)),
+            (None, "", Color::Rgb(119, 136, 153)),
+        ] {
+            let mut data = snapshot();
+            data.workspaces[0].tabs[0].panes[0].agent = agent.map(str::to_owned);
+            let mut app = AppState::new(
+                data,
+                &History::default(),
+                ActiveLocation::default(),
+                Keybindings::default(),
+            );
+            app.toggle_all();
+            let mut terminal = Terminal::new(TestBackend::new(50, 20)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &app, &palette))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let notes_y = tree_y(&app, "pane:named-notes");
+            let review_y = tree_y(&app, "pane:named-review");
+            let editor_y = tree_y(&app, "tab:editor");
+            let feature_y = tree_y(&app, "workspace:worktree");
+            for (x, y, glyph, expected) in [
+                (1, 2, "", Color::Rgb(17, 34, 51)),
+                (4, editor_y, "", Color::Rgb(51, 68, 85)),
+                (7, notes_y, icon, color),
+                (4, feature_y, "", Color::Rgb(34, 51, 68)),
+                (10, review_y, "֎", Color::Indexed(6)),
+            ] {
+                assert_eq!(buffer[(x, y)].symbol(), glyph);
+                assert_eq!(buffer[(x, y)].fg, expected, "{glyph}");
+            }
+            assert_eq!(buffer[(1, editor_y)].fg, palette.muted);
+            assert_eq!(buffer[(3, 2)].fg, palette.text);
+            assert_eq!(buffer[(9, notes_y)].fg, palette.text);
+            assert_eq!(buffer[(48, review_y)].fg, palette.blue);
+            if agent.is_some() {
+                assert_eq!(buffer[(48, notes_y)].fg, palette.yellow);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_icons_survive_search_and_update_when_the_pane_agent_changes() {
+        let mut data = snapshot();
+        let mut app = AppState::new(
+            data.clone(),
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        app.set_query("notes");
+        let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &Palette::default()))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(7, 4)].symbol(), "✳");
+
+        data.workspaces[0].tabs[0].panes[0].agent = Some("codex".into());
+        app.update_snapshot(data.clone(), &History::default());
+        terminal
+            .draw(|frame| render(frame, &app, &Palette::default()))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(7, 4)].symbol(), "֎");
+
+        data.workspaces[0].tabs[0].panes[0].agent = None;
+        app.update_snapshot(data, &History::default());
+        terminal
+            .draw(|frame| render(frame, &app, &Palette::default()))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(7, 4)].symbol(), "");
+    }
+
+    #[test]
+    fn bubbles_are_right_aligned_in_a_separate_column_and_sorted_by_state() {
+        let app = AppState::new(
+            snapshot(),
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        let palette = Palette::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &palette))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let dots: Vec<_> = (0..80)
+            .filter(|&x| matches!(buffer[(x, 2)].symbol(), "●" | ""))
+            .collect();
+        assert_eq!(dots, vec![74, 76, 78]);
+        assert_eq!(buffer[(74, 2)].fg, palette.yellow);
+        assert_eq!(buffer[(76, 2)].fg, Color::Blue);
+        assert_eq!(buffer[(78, 2)].fg, palette.green);
+        assert_eq!(buffer[(78, 2)].symbol(), "");
+        assert_eq!(buffer[(78, tree_y(&app, "tab:editor"))].symbol(), "");
+        assert_eq!(buffer[(1, 2)].symbol(), "");
+        assert_eq!(buffer[(3, 2)].symbol(), "P");
+    }
+
+    #[test]
+    fn completed_agent_bubbles_use_custom_blue_on_panes_and_all_ancestor_rows() {
+        let mut app = AppState::new(
+            snapshot(),
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        app.toggle_all();
+        let palette =
+            Palette::from_config("[theme.custom]\nblue = \"#6495ed\"\nteal = \"#00ffff\"");
+        let mut terminal = Terminal::new(TestBackend::new(50, 20)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &palette))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for (x, y) in [
+            (46, 2),
+            (48, tree_y(&app, "workspace:worktree")),
+            (48, tree_y(&app, "tab:review")),
+            (48, tree_y(&app, "pane:named-review")),
+        ] {
+            assert_eq!(buffer[(x, y)].symbol(), "●");
+            assert_eq!(buffer[(x, y)].fg, Color::Rgb(100, 149, 237));
+        }
+        assert_eq!(buffer[(44, 2)].fg, palette.yellow);
+        assert_eq!(buffer[(48, 2)].fg, palette.green);
+    }
+
+    #[test]
+    fn worktree_has_a_git_branch_glyph_without_changing_its_label() {
+        let app = AppState::new(
+            snapshot(),
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &Palette::default()))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(4, tree_y(&app, "workspace:worktree"))].symbol(),
+            ""
+        );
+        assert!(app.rows.iter().any(|r| r.name == "feature"));
+    }
+
+    #[test]
+    fn each_row_kind_has_a_distinct_glyph_in_the_same_icon_position() {
+        let (_, buffer) = screen(80, 15, "");
+        assert_eq!(buffer[(1, 2)].symbol(), "");
+        assert_eq!(buffer[(4, 6)].symbol(), "");
+        assert_eq!(buffer[(7, 7)].symbol(), "✳");
+        assert_eq!(buffer[(4, 3)].symbol(), "");
+    }
+
+    #[test]
+    fn long_unicode_names_cannot_push_bubbles_out_of_their_column() {
+        let mut data = snapshot();
+        data.workspaces[0].tabs[0].panes[0].name =
+            Some(format!("模型 café {}", "世界 café ".repeat(30)));
+        let mut app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        app.toggle_all();
+        app.set_query("模型");
+        let mut terminal = Terminal::new(TestBackend::new(80, 15)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &Palette::default()))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(78, 4)].symbol(), "●");
+        assert_eq!(terminal.backend().buffer()[(7, 4)].symbol(), "✳");
+        assert_eq!(
+            terminal.backend().buffer()[(9, 4)].fg,
+            Palette::default().accent
+        );
+        assert_eq!(terminal.backend().buffer()[(71, 4)].symbol(), "…");
+        assert_eq!(
+            terminal.backend().buffer()[(78, 4)].fg,
+            Palette::default().yellow
+        );
+    }
+
+    fn screen(width: u16, height: u16, query: &str) -> (String, ratatui::buffer::Buffer) {
+        let mut app = AppState::new(
+            snapshot(),
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        app.toggle_all();
+        app.set_query(query);
+        let palette = Palette::from_config("[theme.custom]\nsidebar_bg = \"#171b20\"");
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, &app, &palette)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = buffer
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, buffer)
+    }
+
+    #[test]
+    fn renders_indented_tree_without_category_tabs_footer_or_row_numbers() {
+        let (text, _) = screen(60, 15, "");
+        assert!(text.contains("Project"));
+        assert!(text.contains("├─ "));
+        assert!(text.contains("reviewer"));
+        for removed in [
+            "Workspaces",
+            "Agents",
+            "Panes",
+            "Ctrl+",
+            "Enter",
+            "Esc",
+            "1.",
+            "2.",
+        ] {
+            assert!(!text.contains(removed), "unexpected UI: {removed}\n{text}");
+        }
+    }
+
+    #[test]
+    fn paints_entire_view_with_sidebar_background() {
+        let (_, buffer) = screen(60, 15, "");
+        assert_eq!(buffer[(59, 14)].bg, Color::Rgb(23, 27, 32));
+    }
+
+    fn tree_lines(text: &str, count: usize) -> Vec<&str> {
+        text.lines()
+            .skip(2)
+            .filter(|line| !line.starts_with('─'))
+            .take(count)
+            .map(|line| line.split(['●', '']).next().unwrap().trim_end())
+            .collect()
+    }
+
+    #[test]
+    fn branch_lines_join_at_the_same_columns_without_duplicate_markers() {
+        let (text, _) = screen(60, 15, "");
+        assert_eq!(
+            tree_lines(&text, 9),
+            vec![
+                "  Project",
+                " ├─  feature",
+                " │  └─  Review",
+                " │     └─ ֎ reviewer",
+                " ├─  Editor",
+                " │  ├─ ✳ notes",
+                " │  └─ ✳ hidden-title",
+                " └─  Tests",
+                "  Other",
+            ]
+        );
+    }
+
+    #[test]
+    fn search_reconnects_only_the_visible_branches() {
+        let (text, _) = screen(60, 15, "reviewer");
+        assert_eq!(
+            tree_lines(&text, 4),
+            vec![
+                "  Project",
+                " └─  feature",
+                "    └─  Review",
+                "       └─ ֎ reviewer",
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_indicator_follows_the_name_without_shifting_tree_columns() {
+        let mut app = AppState::new(
+            snapshot(),
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        app.selected = 0;
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &Palette::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let line: String = (0..40).map(|x| buffer[(x, 2)].symbol()).collect();
+        assert_eq!(
+            line.split(['●', '']).next().unwrap().trim_end(),
+            "  Project [+]"
+        );
+    }
+
+    #[test]
+    fn renders_no_matches_and_tiny_terminals_without_panicking() {
+        assert!(screen(40, 8, "zzzzzz").0.contains("No matches"));
+        for (w, h) in [(1, 1), (3, 2), (8, 2), (20, 4)] {
+            for query in ["", "模型"] {
+                screen(w, h, query);
+            }
+        }
+    }
+
+    #[test]
+    fn scrolls_selection_into_view_and_clips_long_unicode_names() {
+        let mut data = snapshot();
+        data.workspaces[1].tabs[0].panes[0].name = Some("模型 café ".repeat(30));
+        let mut app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+        );
+        app.toggle_all();
+        app.selected = app
+            .rows
+            .iter()
+            .position(|r| r.name.starts_with("模型"))
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(25, 4)).unwrap();
+        terminal
+            .draw(|f| render(f, &app, &Palette::default()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // Wide glyphs occupy two cells; the backing buffer includes a blank continuation cell.
+        assert!(text.contains('模') && text.contains('型'));
     }
 }
