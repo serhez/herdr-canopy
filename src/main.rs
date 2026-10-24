@@ -16,7 +16,10 @@ use clap::Parser;
 use cli::{Cli, Command};
 use crossterm::{
     cursor,
-    event::{self, Event, KeyEventKind},
+    event::{
+        self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute,
     style::ResetColor,
     terminal,
@@ -32,15 +35,28 @@ use tracker::Tracker;
 
 const PLUGIN_ID: &str = "serhez.herdr-canopy";
 
-struct RawTerminal;
+struct RawTerminal {
+    enhanced_keys: bool,
+}
 impl RawTerminal {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode()?;
-        Ok(Self)
+        let mut raw = Self {
+            enhanced_keys: false,
+        };
+        execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+        raw.enhanced_keys = true;
+        Ok(raw)
     }
 }
 impl Drop for RawTerminal {
     fn drop(&mut self) {
+        if self.enhanced_keys {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = terminal::disable_raw_mode();
         let _ = execute!(io::stdout(), cursor::Show, ResetColor);
         let _ = io::stdout().flush();
@@ -375,6 +391,6 @@ mod tests {
     fn custom_keybindings_keep_unspecified_defaults() {
         let bindings: Keybindings = toml::from_str("move_up = ['C-k']").unwrap();
         assert_eq!(bindings.move_up, vec!["C-k"]);
-        assert_eq!(bindings.move_down, vec!["Down", "C-n"]);
+        assert_eq!(bindings.move_down, vec!["Down", "C-n", "D-j", "M-j"]);
     }
 }

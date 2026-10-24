@@ -308,8 +308,8 @@ impl Default for Keybindings {
         }
         Self {
             toggle_all: keys(&["Tab"]),
-            move_up: keys(&["Up", "C-p"]),
-            move_down: keys(&["Down", "C-n"]),
+            move_up: keys(&["Up", "C-p", "D-k", "M-k"]),
+            move_down: keys(&["Down", "C-n", "D-j", "M-j"]),
             expand: keys(&["Right"]),
             collapse: keys(&["Left"]),
             select: keys(&["Enter"]),
@@ -339,6 +339,7 @@ fn parse_key(text: &str) -> Option<KeyEvent> {
             ("S-", KeyModifiers::SHIFT),
             ("M-", KeyModifiers::ALT),
             ("A-", KeyModifiers::ALT),
+            ("D-", KeyModifiers::SUPER),
         ]
         .into_iter()
         .find(|(prefix, _)| rest.starts_with(prefix)) else {
@@ -346,9 +347,6 @@ fn parse_key(text: &str) -> Option<KeyEvent> {
         };
         modifiers |= modifier;
         rest = rest.strip_prefix(prefix)?;
-        if !["C-", "S-", "M-", "A-"].iter().any(|p| rest.starts_with(p)) {
-            break;
-        }
     }
     parse_key_code(rest, modifiers)
 }
@@ -379,7 +377,42 @@ fn parse_key_code(rest: &str, modifiers: KeyModifiers) -> Option<KeyEvent> {
 
 #[cfg(test)]
 mod location_tests {
+    use super::*;
     use serde_json::json;
+
+    #[test]
+    fn command_key_bindings_match_super_without_matching_plain_or_alt_keys() {
+        let bindings = vec!["D-j".into()];
+        assert!(Keybindings::matches(
+            &bindings,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::SUPER)
+        ));
+        for modifiers in [
+            KeyModifiers::NONE,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ] {
+            assert!(!Keybindings::matches(
+                &bindings,
+                KeyEvent::new(KeyCode::Char('j'), modifiers)
+            ));
+        }
+        assert_eq!(
+            parse_key("C-D-k"),
+            Some(KeyEvent::new(
+                KeyCode::Char('k'),
+                KeyModifiers::CONTROL | KeyModifiers::SUPER
+            ))
+        );
+        assert_eq!(
+            parse_key("D-C-k"),
+            Some(KeyEvent::new(
+                KeyCode::Char('k'),
+                KeyModifiers::CONTROL | KeyModifiers::SUPER
+            ))
+        );
+    }
 
     #[test]
     fn invocation_context_wins_over_another_clients_focus() {

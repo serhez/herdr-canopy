@@ -2010,6 +2010,51 @@ mod tree_tests {
     }
 
     #[test]
+    fn default_command_and_alt_j_k_match_arrows_and_leave_plain_letters_as_search() {
+        let bindings = Keybindings::default();
+        for (chord, arrow, modifiers) in [
+            ('j', KeyCode::Down, KeyModifiers::SUPER),
+            ('k', KeyCode::Up, KeyModifiers::SUPER),
+            ('j', KeyCode::Down, KeyModifiers::ALT),
+            ('k', KeyCode::Up, KeyModifiers::ALT),
+        ] {
+            let mut command_app = full_app(
+                snapshot(),
+                &History::default(),
+                ActiveLocation::default(),
+                bindings.clone(),
+            );
+            let mut arrow_app = full_app(
+                snapshot(),
+                &History::default(),
+                ActiveLocation::default(),
+                bindings.clone(),
+            );
+            for kind in [
+                crossterm::event::KeyEventKind::Press,
+                crossterm::event::KeyEventKind::Repeat,
+            ] {
+                let mut event = KeyEvent::new(KeyCode::Char(chord), modifiers);
+                event.kind = kind;
+                assert_eq!(command_app.handle_key(event), KeyAction::Continue);
+                key(&mut arrow_app, arrow);
+                assert_eq!(command_app.selected, arrow_app.selected);
+                assert!(command_app.query.is_empty());
+            }
+        }
+        let mut app = full_app(
+            snapshot(),
+            &History::default(),
+            ActiveLocation::default(),
+            bindings,
+        );
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.query, "j");
+        key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.query, "jk");
+    }
+
+    #[test]
     fn distinct_repositories_with_the_same_name_keep_separate_worktree_groups() {
         let mut data = snapshot();
         let mut other_worktree = data.workspaces[1].clone();

@@ -138,8 +138,8 @@ worktrees use a repository grouping row; Enter on that row moves into its childr
 | Key | Action |
 | --- | --- |
 | Tab | Toggle compact/full view |
-| Up / Ctrl+P | Previous row |
-| Down / Ctrl+N | Next row |
+| Up / Ctrl+P / Cmd+K / Alt+K | Previous row |
+| Down / Ctrl+N / Cmd+J / Alt+J | Next row |
 | Right | Expand a branch, or move to its first child |
 | Left | Collapse a branch, or move to its parent |
 | Enter | Focus the selected destination |
@@ -212,8 +212,8 @@ their defaults. The defaults are:
 ```toml
 [keybindings]
 toggle_all = ["Tab"]
-move_up = ["Up", "C-p"]
-move_down = ["Down", "C-n"]
+move_up = ["Up", "C-p", "D-k", "M-k"]
+move_down = ["Down", "C-n", "D-j", "M-j"]
 expand = ["Right"]
 collapse = ["Left"]
 select = ["Enter"]
@@ -222,9 +222,13 @@ force_quit = ["C-c"]
 backspace = ["Backspace"]
 ```
 
-Bindings accept named keys, literal characters, and `C-`, `S-`, `M-`/`A-`
-modifiers. Settings are read when the popup opens. Configure the shortcut that
-opens the popup separately in Herdr.
+Bindings accept named keys, literal characters, and `C-` (Control), `S-` (Shift),
+`M-`/`A-` (Alt), and `D-` (Command/Super) modifiers. Settings are read when the
+popup opens. Configure the shortcut that opens the popup separately in Herdr.
+
+Cmd/Alt+J moves down and Cmd/Alt+K moves up inside Canopy by default. These
+bindings apply to Canopy's terminal UI. Canopy requests enhanced keyboard
+reporting to receive Command/Super keys and restores the previous mode on exit.
 
 ### Appearance
 
