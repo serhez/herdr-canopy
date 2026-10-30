@@ -2,6 +2,22 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum View {
+    #[default]
+    Tree,
+    Agents,
+}
+
+impl View {
+    pub fn entrypoint(self) -> &'static str {
+        match self {
+            Self::Tree => "navigator",
+            Self::Agents => "agents",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActiveLocation {
     pub workspace_id: Option<String>,

@@ -1,7 +1,7 @@
 # Herdr Canopy
 
 Navigate [Herdr](https://herdr.dev/) workspaces, worktrees, tabs, and panes from a
-searchable tree, with agent activity visible alongside each destination.
+searchable tree or a flat agents-only list, with live agent activity.
 
 Open the popup and press Enter to reach the pane that needs your attention most.
 Blocked agents come first, followed by unseen completions, working agents, and
@@ -18,7 +18,7 @@ Agent status bubbles and working times update while the navigator is open.
       └─ ֎ runner                       12s  ●
 ```
 
-- **One tree:** workspaces contain tabs and panes; linked worktrees add a branch
+- **Workspace tree:** workspaces contain tabs and panes; linked worktrees add a branch
   beneath their main workspace.
 - **Attention-aware switching:** blocked, completed, and working agents take
   priority, with recent focus breaking ties.
@@ -26,6 +26,8 @@ Agent status bubbles and working times update while the navigator is open.
   preferred destination. Press Tab for the full tree.
 - **Agent activity:** provider icons, status bubbles, and working times for Codex
   and Claude help you find work that needs attention.
+- **Agents-only mode:** one row per agent with workspace and optional worktree
+  context, ordered globally by attention and recency.
 - **Terminal colors:** the popup follows your terminal palette and Herdr theme.
 
 ## Installation
@@ -60,6 +62,12 @@ key = "cmd+s"
 type = "plugin_action"
 command = "serhez.herdr-canopy.toggle"
 description = "Toggle workspace tree"
+
+[[keys.command]]
+key = "cmd+a"
+type = "plugin_action"
+command = "serhez.herdr-canopy.toggle-agents"
+description = "Toggle agents"
 ```
 
 Reload Herdr's configuration:
@@ -68,8 +76,10 @@ Reload Herdr's configuration:
 herdr server reload-config
 ```
 
-Press Cmd+S to open the navigator; press it again to close it. Choose another key
-in Herdr's configuration if you prefer. The plugin does not reserve a shortcut
+Press Cmd+S for the tree or Cmd+A for agents. Press the same shortcut again to
+close its popup; the other shortcut switches modes. For Alt shortcuts, add the
+same bindings with `key = "alt+s"` and `key = "alt+a"`. Choose other keys in
+Herdr's configuration if you prefer. The plugin does not reserve shortcuts
 internally.
 
 You can also invoke it from a Herdr terminal:
@@ -80,16 +90,50 @@ herdr plugin action invoke serhez.herdr-canopy.toggle
 
 | Plugin action | Behavior |
 | --- | --- |
-| `serhez.herdr-canopy.toggle` | Open the navigator, or close its active popup |
-| `serhez.herdr-canopy.open` | Open the navigator, keeping an existing instance open |
+| `serhez.herdr-canopy.toggle` | Toggle the workspace tree |
+| `serhez.herdr-canopy.open` | Open the workspace tree |
+| `serhez.herdr-canopy.toggle-agents` | Toggle the agents-only list |
+| `serhez.herdr-canopy.open-agents` | Open the agents-only list |
+
+Canopy keeps one popup per session. Opening a different mode replaces the active
+popup; opening the same mode keeps it open. Both modes share focus history and
+working-time tracking, and use the same 65-column, 30-row popup size.
 
 ## Navigation
 
-Each popup starts in **compact view**: workspaces and linked worktrees, every
+The tree popup starts in **compact view**: workspaces and linked worktrees, every
 pane containing an agent, and the preselected preferred destination, with their
 ancestors. Agent panes appear regardless of provider or status, including unnamed
 panes. Press **Tab** for the full tree, which also includes other tabs and
 manually named panes. `[all]` beside the search input indicates full view.
+
+### Agents-only mode
+
+Every row represents one pane containing an agent, including unnamed agents and
+every provider/status. The workspace and optional worktree appear inline, with
+middle-dot separators; tab names and tree guides are omitted:
+
+```text
+ Project · ✳ notes                                    1m 5s  ●
+ Project ·  fix-tests · ֎ runner                       12s  ●
+```
+
+Agents follow the same attention-aware MRU priority as the tree, sorted globally
+across all tabs, worktrees, and workspaces. The current agent remains visible as
+disabled gray context, with its bubble retaining its status color. The first
+selectable agent is preselected; there is no tab/workspace fallback when the list
+is empty.
+
+Search retains the tree's matching rules: workspace, worktree, or tab matches
+reveal their agent panes, and pane-name matches reveal that agent. Tab names
+remain searchable even though they are omitted from rows. Search selects the
+first eligible agent by attention and recency. Live refreshes preserve the
+selected agent when it remains visible. Tab and Left/Right have no effect in this
+flat mode; the other navigation keys work as in the tree.
+
+Icons, status colors, timers, and name fallbacks are shared with the tree. Long
+workspace, worktree, and pane names are shortened individually with `…`, keeping
+their icons visible and reserving space for the complete running time and bubble.
 
 ### Attention-aware MRU
 
@@ -108,13 +152,13 @@ the tree.
 
 The highest-priority eligible pane is preselected on opening. When no agent needs
 attention or is working, this returns you to the most recent eligible pane. If
-there are no selectable panes, the navigator falls back to a recent tab or
-workspace. Herdr supplies the agent states; a completed agent loses its blue
+there are no selectable panes, tree mode falls back to a recent tab or workspace.
+Herdr supplies the agent states; a completed agent loses its blue
 priority when Herdr marks it seen/idle after a visit.
 
 ### Search
 
-Type to fuzzy-search workspace, worktree, tab, and pane names, case insensitively.
+In the tree, type to fuzzy-search workspace, worktree, tab, and pane names, case insensitively.
 A workspace, worktree, or tab name match reveals its eligible panes and their
 ancestors. A pane-name match keeps its ancestors for context without revealing
 unrelated branches. Unnamed panes without agents remain excluded.
@@ -129,7 +173,7 @@ Search temporarily opens matching branches. Clearing it restores your collapsed
 branches and the preferred destination selection. Live refreshes and full-view
 toggling preserve your selected destination when it remains visible.
 
-The current workspace and tab are context rows. The current agent pane also
+In the tree, the current workspace and tab are context rows. The current agent pane also
 stays visible as context: its text and icon are dimmed, while its bubble keeps its
 status color. These rows cannot switch focus to the current location. The current
 pane without an agent stays hidden. When a main workspace is closed, its linked
@@ -137,11 +181,11 @@ worktrees use a repository grouping row; Enter on that row moves into its childr
 
 | Key | Action |
 | --- | --- |
-| Tab | Toggle compact/full view |
+| Tab | Toggle compact/full view (tree only) |
 | Up / Ctrl+P / Cmd+K / Alt+K | Previous row |
 | Down / Ctrl+N / Cmd+J / Alt+J | Next row |
-| Right | Expand a branch, or move to its first child |
-| Left | Collapse a branch, or move to its parent |
+| Right | Expand a branch, or move to its first child (tree only) |
+| Left | Collapse a branch, or move to its parent (tree only) |
 | Enter | Focus the selected destination |
 | Esc | Clear search; close when search is empty |
 | Ctrl+C | Close |
@@ -157,15 +201,16 @@ by `֎` for Codex, `✳` for Claude, or `◇` for another agent provider.
 Manual pane names take precedence. An unnamed agent pane uses its cleaned
 terminal title, then its raw title, then the agent type and pane ID. These are
 display labels; the navigator does not rename panes. Unnamed panes without agents
-are excluded from both views.
+are excluded in compact, full, and agents-only views.
 
 Long names end with `…`, preserving whole Unicode characters and emoji. Search
 still uses the full name. Working times stay complete while names shorten.
 
 ## Agent activity
 
-The right side of each row shows one bubble per nested agent, including agents
-in hidden, unnamed, or current panes. Workspace totals include linked worktrees.
+In the tree, the right side of each row shows one bubble per nested agent,
+including agents in hidden, unnamed, or current panes. Workspace totals include
+linked worktrees. Agents-only rows each show their own agent's bubble.
 Bubbles are ordered by status:
 
 | Status | Color | Marker |
@@ -262,10 +307,11 @@ cargo test --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo fmt --check
 cargo run --locked -- --mock
+cargo run --locked -- --mock --view agents
 ```
 
 The mock preview uses sample data without connecting to Herdr. Live connection
-failures are reported; a failed refresh keeps the last complete tree and shows
+failures are reported; a failed refresh keeps the last complete view and shows
 an error.
 
 ## Credits and license

@@ -2,7 +2,7 @@
 name = "herdr-canopy"
 version = "1.0.0"
 edition = "2024"
-description = "Attention-aware tree navigation for Herdr workspaces, worktrees, tabs, and panes."
+description = "Attention-aware workspace tree and flat agent navigation for Herdr."
 license = "MIT"
 repository = "https://github.com/serhez/herdr-canopy"
 readme = "README.md"

@@ -1,6 +1,6 @@
 use crate::{
-    app::{AppState, RowKind},
-    models::{AgentProvider, AgentStatus},
+    app::{AppState, Row, RowKind},
+    models::{AgentProvider, AgentStatus, View},
     theme::Palette,
 };
 use ratatui::{
@@ -58,6 +58,101 @@ fn ellipsize(line: Line<'_>, width: usize, style: Style) -> Line<'_> {
     Line::from(spans)
 }
 
+fn icon(
+    kind: RowKind,
+    provider: Option<AgentProvider>,
+    palette: &Palette,
+) -> (&'static str, Color) {
+    match kind {
+        RowKind::Workspace => (" ", palette.blue),
+        RowKind::Worktree => (" ", palette.mauve),
+        RowKind::Tab => (" ", palette.yellow),
+        RowKind::Pane => match provider {
+            Some(AgentProvider::Codex) => ("֎ ", Color::Indexed(6)),
+            Some(AgentProvider::Claude) => ("✳ ", palette.peach),
+            Some(AgentProvider::Other) => ("◇ ", palette.teal),
+            None => (" ", palette.text),
+        },
+    }
+}
+
+fn label(
+    name: &str,
+    matches: &[usize],
+    style: Style,
+    disabled: bool,
+    palette: &Palette,
+) -> Line<'static> {
+    let mut offset = 0;
+    let spans = Span::raw(name)
+        .styled_graphemes(Style::default())
+        .map(|grapheme| {
+            let end = offset + grapheme.symbol.chars().count();
+            let index = matches.partition_point(|&i| i < offset);
+            let matched = matches.get(index).is_some_and(|&i| i < end);
+            offset = end;
+            Span::styled(
+                grapheme.symbol.to_owned(),
+                if matched && !disabled {
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
+}
+
+fn agent_name(row: &Row, width: usize, palette: &Palette) -> Line<'static> {
+    let disabled = row.target.is_none();
+    let style = Style::default().fg(if disabled {
+        palette.muted
+    } else {
+        palette.text
+    });
+    let mut parts: Vec<_> = row
+        .breadcrumbs
+        .iter()
+        .map(|p| (p.kind, p.name.as_str(), p.matches.as_slice()))
+        .collect();
+    parts.push((row.kind, &row.name, &row.matches));
+    let budget = width.saturating_sub(1 + 2 * parts.len() + 3 * (parts.len() - 1));
+    let mut lengths: Vec<_> = parts
+        .iter()
+        .map(|(_, name, _)| Span::raw(*name).width().min(budget))
+        .collect();
+    // Shorten the longest names first, retaining each breadcrumb and the agent icon.
+    while lengths.iter().sum::<usize>() > budget {
+        let i = (0..lengths.len())
+            .max_by_key(|&i| (lengths[i], std::cmp::Reverse(i)))
+            .unwrap();
+        lengths[i] -= 1;
+    }
+    let mut spans = vec![Span::raw(" ")];
+    for (i, ((kind, name, matches), length)) in parts.into_iter().zip(lengths).enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(palette.muted)));
+        }
+        let (glyph, color) = icon(kind, row.provider, palette);
+        spans.push(Span::styled(
+            glyph,
+            Style::default().fg(if disabled { palette.muted } else { color }),
+        ));
+        spans.extend(
+            ellipsize(
+                label(name, matches, style, disabled, palette),
+                length,
+                style,
+            )
+            .spans,
+        );
+    }
+    Line::from(spans)
+}
+
 fn render_at(frame: &mut Frame, app: &AppState, palette: &Palette, now_ms: u64) {
     let area = frame.area();
     let style = Style::default().bg(palette.background).fg(palette.text);
@@ -75,7 +170,11 @@ fn render_at(frame: &mut Frame, app: &AppState, palette: &Palette, now_ms: u64) 
     let mut prompt = vec![Span::styled(" > ", Style::default().fg(palette.accent))];
     if app.query.is_empty() {
         prompt.push(Span::styled(
-            "Search workspaces, tabs, panes",
+            if app.view == View::Agents {
+                "Search agents"
+            } else {
+                "Search workspaces, tabs, panes"
+            },
             Style::default().fg(palette.muted),
         ));
     } else {
@@ -157,51 +256,31 @@ fn render_at(frame: &mut Frame, app: &AppState, palette: &Palette, now_ms: u64) 
             }
         }
         let current_pane = row.kind == RowKind::Pane && row.target.is_none();
-        let mut name = vec![Span::styled(
-            format!(" {}", row.prefix),
-            Style::default().fg(palette.muted),
-        )];
-        let (glyph, color) = match row.kind {
-            RowKind::Workspace => (" ", palette.blue),
-            RowKind::Worktree => (" ", palette.mauve),
-            RowKind::Tab => (" ", palette.yellow),
-            RowKind::Pane => match row.provider {
-                Some(AgentProvider::Codex) => ("֎ ", Color::Indexed(6)),
-                Some(AgentProvider::Claude) => ("✳ ", palette.peach),
-                Some(AgentProvider::Other) => ("◇ ", palette.teal),
-                None => (" ", palette.text),
-            },
-        };
-        name.push(Span::styled(
-            glyph,
-            Style::default().fg(if current_pane { palette.muted } else { color }),
-        ));
         let label_style = if current_pane {
             Style::default().fg(palette.muted)
-        } else if row.depth == 0 {
+        } else if row.depth == 0 && app.view == View::Tree {
             Style::default().add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        let mut offset = 0;
-        let label = Span::raw(row.name.as_str());
-        for grapheme in label.styled_graphemes(Style::default()) {
-            let end = offset + grapheme.symbol.chars().count();
-            let match_index = row.matches.partition_point(|&i| i < offset);
-            let matched = row.matches.get(match_index).is_some_and(|&i| i < end);
-            let text_style = if !current_pane && matched {
-                Style::default()
-                    .fg(palette.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                label_style
-            };
-            name.push(Span::styled(grapheme.symbol.to_owned(), text_style));
-            offset = end;
-        }
-        if row.has_children && !row.expanded {
-            name.push(Span::styled(" [+]", Style::default().fg(palette.muted)));
-        }
+        let name = if app.view == View::Agents {
+            agent_name(row, name_width as usize, palette)
+        } else {
+            let mut name = vec![Span::styled(
+                format!(" {}", row.prefix),
+                Style::default().fg(palette.muted),
+            )];
+            let (glyph, color) = icon(row.kind, row.provider, palette);
+            name.push(Span::styled(
+                glyph,
+                Style::default().fg(if current_pane { palette.muted } else { color }),
+            ));
+            name.extend(label(&row.name, &row.matches, label_style, current_pane, palette).spans);
+            if row.has_children && !row.expanded {
+                name.push(Span::styled(" [+]", Style::default().fg(palette.muted)));
+            }
+            Line::from(name)
+        };
         let mut status = Vec::new();
         if !elapsed.is_empty() && elapsed.len() + 4 <= status_width as usize {
             status.push(Span::styled(
@@ -232,7 +311,7 @@ fn render_at(frame: &mut Frame, app: &AppState, palette: &Palette, now_ms: u64) 
             )
         }));
         let mut cells = vec![Cell::from(ellipsize(
-            Line::from(name),
+            name,
             name_width as usize,
             label_style,
         ))];
@@ -254,12 +333,177 @@ mod tree_tests {
     use super::*;
     use crate::{
         app::AppState,
-        models::{ActiveLocation, History, Keybindings},
+        models::{ActiveLocation, History, Keybindings, View},
         test_helpers::snapshot,
         theme::Palette,
     };
     use ratatui::style::Color;
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn agents_screen(app: &AppState, width: u16, height: u16, now: u64) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_at(frame, app, &Palette::default(), now))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn line(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn agent_rows_render_workspace_optional_worktree_provider_and_status_without_tabs_or_tree() {
+        let mut data = snapshot();
+        data.workspaces[0].tabs[0].panes[0].working_since_ms = Some(1000);
+        let app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+            View::Agents,
+        );
+        let buffer = agents_screen(&app, 65, 30, 6000);
+        assert!(line(&buffer, 0).contains("Search agents"));
+        assert_eq!(
+            line(&buffer, 2).trim_end(),
+            "  Project ·  feature · ֎ reviewer                            ●"
+        );
+        assert_eq!(
+            line(&buffer, 3).trim_end(),
+            "  Project · ✳ notes                                       5s  ●"
+        );
+        assert_eq!(
+            line(&buffer, 4).trim_end(),
+            "  Project · ✳ hidden-title                                    "
+        );
+        for y in 2..30 {
+            let text = line(&buffer, y);
+            assert!(!text.contains(['│', '├', '└', '─']));
+            assert!(
+                !text.contains("Editor") && !text.contains("Review") && !text.contains("[all]")
+            );
+        }
+        let palette = Palette::default();
+        for (symbol, expected) in [
+            ("", palette.blue),
+            ("", palette.mauve),
+            ("֎", Color::Indexed(6)),
+        ] {
+            let x = (0..65)
+                .find(|&x| buffer[(x, 2)].symbol() == symbol)
+                .unwrap();
+            assert_eq!(buffer[(x, 2)].fg, expected);
+        }
+        let x = (0..65).find(|&x| buffer[(x, 3)].symbol() == "5").unwrap();
+        assert_eq!(buffer[(x, 3)].fg, palette.subtext);
+        assert_eq!(buffer[(63, 2)].fg, palette.blue);
+        assert_eq!(buffer[(63, 3)].fg, palette.yellow);
+        assert_eq!(buffer[(63, 4)].fg, palette.green);
+    }
+
+    #[test]
+    fn current_agent_breadcrumbs_icons_matches_and_time_are_gray_except_the_bubble() {
+        let mut data = snapshot();
+        data.workspaces[1].tabs[0].panes[0].status = AgentStatus::Working;
+        data.workspaces[1].tabs[0].panes[0].working_since_ms = Some(1000);
+        let current = ActiveLocation {
+            workspace_id: Some("worktree".into()),
+            tab_id: Some("review".into()),
+            pane_id: Some("named-review".into()),
+        };
+        let mut app = AppState::new(
+            data,
+            &History::default(),
+            current,
+            Keybindings::default(),
+            View::Agents,
+        );
+        app.set_query("Project");
+        let buffer = agents_screen(&app, 65, 30, 6000);
+        let y = (2 + app
+            .rows
+            .iter()
+            .position(|r| r.key == "pane:named-review")
+            .unwrap()) as u16;
+        assert!(line(&buffer, y).contains("Project ·  feature · ֎ reviewer"));
+        for x in 0..63 {
+            if buffer[(x, y)].symbol() != " " {
+                assert_eq!(buffer[(x, y)].fg, Palette::default().muted);
+            }
+        }
+        assert_eq!(buffer[(63, y)].fg, Palette::default().yellow);
+        assert!(
+            app.rows
+                .iter()
+                .find(|r| r.key == "pane:named-review")
+                .unwrap()
+                .target
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn agent_breadcrumb_search_highlights_workspace_worktree_and_pane_names() {
+        let mut app = AppState::new(
+            snapshot(),
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+            View::Agents,
+        );
+        for (query, matched) in [
+            ("Project", "Project"),
+            ("feature", "feature"),
+            ("reviewer", "reviewer"),
+        ] {
+            app.set_query(query);
+            let buffer = agents_screen(&app, 65, 30, 0);
+            let text = line(&buffer, 2);
+            let start = text.chars().collect::<String>().find(matched).unwrap();
+            let x = text[..start].chars().count() as u16;
+            for i in 0..matched.len() as u16 {
+                assert_eq!(buffer[(x + i, 2)].fg, Palette::default().accent, "{query}");
+                assert!(buffer[(x + i, 2)].modifier.contains(Modifier::BOLD));
+            }
+        }
+    }
+
+    #[test]
+    fn long_agent_paths_ellipsize_names_individually_and_reserve_whole_timers() {
+        let mut data = snapshot();
+        data.workspaces[0].name = "Workspace-long-name".repeat(20);
+        data.workspaces[1].name = "分支🦀long-name".repeat(20);
+        data.workspaces[1].tabs[0].panes[0].name = Some("agent-long-name".repeat(20));
+        data.workspaces[1].tabs[0].panes[0].status = AgentStatus::Working;
+        data.workspaces[1].tabs[0].panes[0].working_since_ms = Some(1000);
+        let mut app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+            View::Agents,
+        );
+        app.set_query("分支");
+        let buffer = agents_screen(&app, 65, 30, 93_785_000);
+        let text = line(&buffer, 2);
+        assert!(text.contains('') && text.contains('') && text.contains('֎'));
+        assert_eq!(text.matches('…').count(), 3);
+        assert!(text.ends_with("1d 2h 3m 4s  ● "));
+        for width in 0..22 {
+            let _ = agents_screen(&app, width, 6, 93_785_000);
+        }
+        let empty = AppState::new(
+            crate::models::Snapshot::default(),
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+            View::Agents,
+        );
+        assert!(line(&agents_screen(&empty, 65, 10, 0), 2).contains("No matches"));
+    }
 
     fn tree_y(app: &AppState, key: &str) -> u16 {
         let index = app.rows.iter().position(|row| row.key == key).unwrap();
@@ -320,6 +564,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.toggle_all();
         let palette =
@@ -370,6 +615,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         terminal
@@ -392,6 +638,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         for width in [1, 3, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20] {
             let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
@@ -420,6 +667,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.toggle_all();
         app.selected = app.rows.iter().position(|row| row.name == "Other").unwrap();
@@ -462,6 +710,7 @@ mod tree_tests {
                 &History::default(),
                 ActiveLocation::default(),
                 Keybindings::default(),
+                View::Tree,
             );
             let mut terminal = Terminal::new(TestBackend::new(55, 20)).unwrap();
             terminal
@@ -496,6 +745,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         let palette = Palette::default();
         let mut terminal = Terminal::new(TestBackend::new(55, 10)).unwrap();
@@ -555,6 +805,7 @@ mod tree_tests {
                 &History::default(),
                 ActiveLocation::default(),
                 Keybindings::default(),
+                View::Tree,
             );
             app.toggle_all();
             let mut terminal = Terminal::new(TestBackend::new(55, 20)).unwrap();
@@ -596,6 +847,7 @@ mod tree_tests {
                 &History::default(),
                 ActiveLocation::default(),
                 Keybindings::default(),
+                View::Tree,
             );
             let mut terminal = Terminal::new(TestBackend::new(55, 20)).unwrap();
             terminal
@@ -619,6 +871,7 @@ mod tree_tests {
                 pane_id: Some("named-notes".into()),
             },
             Keybindings::default(),
+            View::Tree,
         );
         app.set_query("notes");
         let palette =
@@ -680,6 +933,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.toggle_all();
         let notes_y = tree_y(&app, "pane:named-notes");
@@ -753,6 +1007,7 @@ mod tree_tests {
                 &History::default(),
                 ActiveLocation::default(),
                 Keybindings::default(),
+                View::Tree,
             );
             app.toggle_all();
             let mut terminal = Terminal::new(TestBackend::new(55, 20)).unwrap();
@@ -782,6 +1037,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.toggle_all();
         let mut terminal = Terminal::new(TestBackend::new(45, 20)).unwrap();
@@ -821,6 +1077,7 @@ mod tree_tests {
                 &History::default(),
                 ActiveLocation::default(),
                 Keybindings::default(),
+                View::Tree,
             );
             app.toggle_all();
             let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
@@ -867,6 +1124,7 @@ overlay0 = "#8899aa"
                 &History::default(),
                 ActiveLocation::default(),
                 Keybindings::default(),
+                View::Tree,
             );
             app.toggle_all();
             let mut terminal = Terminal::new(TestBackend::new(50, 20)).unwrap();
@@ -906,6 +1164,7 @@ overlay0 = "#8899aa"
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.set_query("notes");
         let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
@@ -936,6 +1195,7 @@ overlay0 = "#8899aa"
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         let palette = Palette::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
@@ -963,6 +1223,7 @@ overlay0 = "#8899aa"
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.toggle_all();
         let palette =
@@ -992,6 +1253,7 @@ overlay0 = "#8899aa"
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
         terminal
@@ -1023,6 +1285,7 @@ overlay0 = "#8899aa"
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.toggle_all();
         app.set_query("模型");
@@ -1049,6 +1312,7 @@ overlay0 = "#8899aa"
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.toggle_all();
         app.set_query(query);
@@ -1140,6 +1404,7 @@ overlay0 = "#8899aa"
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.selected = 0;
         app.handle_key(crossterm::event::KeyEvent::new(
@@ -1177,6 +1442,7 @@ overlay0 = "#8899aa"
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.toggle_all();
         app.selected = app

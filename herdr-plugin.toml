@@ -1,7 +1,7 @@
 id = "serhez.herdr-canopy"
 name = "Herdr Canopy"
 version = "1.0.0"
-description = "Attention-aware tree navigation for workspaces, worktrees, tabs, and agent panes."
+description = "Attention-aware workspace tree and flat agent navigation."
 min_herdr_version = "0.9.5"
 platforms = ["macos", "linux"]
 
@@ -19,6 +19,18 @@ id = "open"
 title = "Open workspace tree"
 contexts = ["global", "workspace"]
 command = ["./target/release/herdr-canopy", "--pane-open"]
+
+[[actions]]
+id = "toggle-agents"
+title = "Toggle agents"
+contexts = ["global", "workspace"]
+command = ["./target/release/herdr-canopy", "toggle", "--view", "agents"]
+
+[[actions]]
+id = "open-agents"
+title = "Open agents"
+contexts = ["global", "workspace"]
+command = ["./target/release/herdr-canopy", "--pane-open", "--view", "agents"]
 
 [[events]]
 on = "workspace.focused"
@@ -51,3 +63,11 @@ placement = "popup"
 width = 65
 height = 30
 command = ["./target/release/herdr-canopy"]
+
+[[panes]]
+id = "agents"
+title = "Canopy Agents"
+placement = "popup"
+width = 65
+height = 30
+command = ["./target/release/herdr-canopy", "--view", "agents"]

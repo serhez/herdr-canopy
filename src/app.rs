@@ -1,6 +1,6 @@
 use crate::models::{
     ActiveLocation, AgentProvider, AgentStatus, FocusTarget, History, KeyAction, Keybindings,
-    Snapshot, Workspace,
+    Snapshot, View, Workspace,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nucleo_matcher::{
@@ -37,6 +37,13 @@ struct Node {
     rank: (u8, u64),
 }
 
+#[derive(Clone)]
+pub struct Breadcrumb {
+    pub name: String,
+    pub kind: RowKind,
+    pub matches: Vec<usize>,
+}
+
 pub struct Row {
     pub key: String,
     pub name: String,
@@ -51,8 +58,43 @@ pub struct Row {
     pub expanded: bool,
     pub matches: Vec<usize>,
     pub score: Option<u32>,
+    pub breadcrumbs: Vec<Breadcrumb>,
     timestamp: u64,
     parent: Option<usize>,
+}
+
+impl Row {
+    fn from_node(node: &Node, pattern: Option<&Pattern>, matcher: &mut Matcher) -> Self {
+        let mut matches = Vec::new();
+        let mut buffer = Vec::new();
+        let score = pattern.and_then(|p| {
+            p.indices(
+                Utf32Str::new(&node.name, &mut buffer),
+                matcher,
+                &mut matches,
+            )
+        });
+        matches.sort_unstable();
+        matches.dedup();
+        Self {
+            key: node.key.clone(),
+            name: node.name.clone(),
+            target: node.target.clone(),
+            agents: node.agents.clone(),
+            provider: node.provider,
+            working_since_ms: node.working_since_ms,
+            kind: node.kind,
+            depth: 0,
+            prefix: String::new(),
+            has_children: !node.children.is_empty(),
+            expanded: false,
+            matches: matches.into_iter().map(|i| i as usize).collect(),
+            score,
+            breadcrumbs: Vec::new(),
+            timestamp: node.timestamp,
+            parent: None,
+        }
+    }
 }
 
 pub struct AppState {
@@ -65,6 +107,7 @@ pub struct AppState {
     pub error: Option<String>,
     current: ActiveLocation,
     pub show_all: bool,
+    pub view: View,
     preferred_key: Option<String>,
 }
 
@@ -74,6 +117,7 @@ impl AppState {
         history: &History,
         current: ActiveLocation,
         keybindings: Keybindings,
+        view: View,
     ) -> Self {
         let roots = build_tree(snapshot, history, &current);
         let preferred_key = preferred_key(&roots);
@@ -87,6 +131,7 @@ impl AppState {
             error: None,
             current,
             show_all: false,
+            view,
             preferred_key,
         };
         state.rebuild();
@@ -115,16 +160,36 @@ impl AppState {
             .collect();
         filtered.sort_by(|a, b| b.rank.cmp(&a.rank));
         self.rows.clear();
-        flatten(
-            &filtered,
-            "",
-            0,
-            None,
-            &self.collapsed,
-            pattern.as_ref(),
-            &mut matcher,
-            &mut self.rows,
-        );
+        if self.view == View::Agents {
+            flatten_agents(
+                &filtered,
+                &[],
+                pattern.as_ref(),
+                &mut matcher,
+                &mut self.rows,
+            );
+            self.rows.sort_by_key(|row| {
+                std::cmp::Reverse((
+                    if row.target.is_some() {
+                        pane_priority(&row.agents)
+                    } else {
+                        0
+                    },
+                    row.timestamp,
+                ))
+            });
+        } else {
+            flatten(
+                &filtered,
+                "",
+                0,
+                None,
+                &self.collapsed,
+                pattern.as_ref(),
+                &mut matcher,
+                &mut self.rows,
+            );
+        }
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
     }
 
@@ -148,6 +213,9 @@ impl AppState {
     }
 
     pub fn toggle_all(&mut self) {
+        if self.view == View::Agents {
+            return;
+        }
         let key = self.rows.get(self.selected).map(|row| row.key.clone());
         self.show_all = !self.show_all;
         self.rebuild();
@@ -610,31 +678,15 @@ fn flatten(
         } else {
             format!("{ancestor_prefix}{}", if last { "└─ " } else { "├─ " })
         };
-        let mut matches = Vec::new();
-        let mut buf = Vec::new();
-        let score = pattern
-            .and_then(|p| p.indices(Utf32Str::new(&node.name, &mut buf), matcher, &mut matches));
-        matches.sort_unstable();
-        matches.dedup();
         let expanded =
             !node.children.is_empty() && (pattern.is_some() || !collapsed.contains(&node.key));
         let row_index = rows.len();
         rows.push(Row {
-            key: node.key.clone(),
-            name: node.name.clone(),
-            target: node.target.clone(),
-            agents: node.agents.clone(),
-            provider: node.provider,
-            working_since_ms: node.working_since_ms,
-            kind: node.kind,
             depth,
             prefix,
-            has_children: !node.children.is_empty(),
             expanded,
-            matches: matches.into_iter().map(|n| n as usize).collect(),
-            score,
-            timestamp: node.timestamp,
             parent,
+            ..Row::from_node(node, pattern, matcher)
         });
         if expanded {
             let next_prefix = if depth == 0 {
@@ -656,13 +708,324 @@ fn flatten(
     }
 }
 
+fn flatten_agents(
+    nodes: &[Node],
+    breadcrumbs: &[Breadcrumb],
+    pattern: Option<&Pattern>,
+    matcher: &mut Matcher,
+    rows: &mut Vec<Row>,
+) {
+    for node in nodes {
+        let mut row = Row::from_node(node, pattern, matcher);
+        if node.kind == RowKind::Pane && node.provider.is_some() {
+            row.breadcrumbs = breadcrumbs.to_vec();
+            rows.push(row);
+        } else {
+            let mut path = breadcrumbs.to_vec();
+            if node.kind.is_workspace() {
+                path.push(Breadcrumb {
+                    name: row.name,
+                    kind: row.kind,
+                    matches: row.matches,
+                });
+            }
+            flatten_agents(&node.children, &path, pattern, matcher, rows);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tree_tests {
     use super::*;
-    use crate::models::FocusTarget;
+    use crate::models::{FocusTarget, View};
     use crate::test_helpers::snapshot;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashMap;
+
+    #[test]
+    fn agents_are_flat_and_globally_prioritized_across_workspaces_worktrees_and_tabs() {
+        let (mut data, history) = priority_fixture();
+        data.workspaces[0].worktree = snapshot().workspaces[0].worktree.clone();
+        let mut worktree = snapshot().workspaces.remove(1);
+        worktree.tabs[0].panes = data.workspaces[0].tabs[0].panes.drain(2..4).collect();
+        let mut other = snapshot().workspaces.remove(2);
+        let mut tab = data.workspaces[0].tabs[0].clone();
+        tab.id = "elsewhere".into();
+        tab.panes = vec![data.workspaces[0].tabs[0].panes.remove(1)];
+        other.tabs.push(tab);
+        data.workspaces.extend([worktree, other]);
+        let app = AppState::new(
+            data,
+            &history,
+            ActiveLocation::default(),
+            Keybindings::default(),
+            View::Agents,
+        );
+        assert_eq!(
+            app.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            [
+                "red-new",
+                "red-old",
+                "blue-new",
+                "blue-old",
+                "yellow-new",
+                "yellow-old",
+                "idle",
+                "unknown"
+            ]
+        );
+        assert_eq!(
+            app.selected_target(),
+            Some(FocusTarget::Pane("red-new".into()))
+        );
+        assert!(app.rows.iter().all(|r| r.kind == RowKind::Pane
+            && r.provider.is_some()
+            && r.depth == 0
+            && r.prefix.is_empty()
+            && !r.has_children
+            && r.parent.is_none()));
+        let path = |name: &str| {
+            app.rows
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .breadcrumbs
+                .iter()
+                .map(|part| (part.name.as_str(), part.kind))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            path("blue-new"),
+            [
+                ("Project", RowKind::Workspace),
+                ("feature", RowKind::Worktree)
+            ]
+        );
+        assert_eq!(path("red-new"), [("Other", RowKind::Workspace)]);
+    }
+
+    #[test]
+    fn agents_keep_unnamed_and_other_providers_but_never_plain_panes_or_containers() {
+        let mut data = snapshot();
+        let mut plain = data.workspaces[0].tabs[0].panes[0].clone();
+        plain.id = "shell".into();
+        plain.name = Some("named shell".into());
+        plain.agent = None;
+        data.workspaces[0].tabs[0].panes.push(plain);
+        data.workspaces[0].tabs[0].panes[1].agent = Some("opencode".into());
+        let mut app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+            View::Agents,
+        );
+        assert_eq!(app.rows.len(), 3);
+        assert!(
+            app.rows
+                .iter()
+                .any(|r| r.name == "hidden-title" && r.provider == Some(AgentProvider::Other))
+        );
+        let keys = app.rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>();
+        for code in [KeyCode::Tab, KeyCode::Left, KeyCode::Right] {
+            key(&mut app, code);
+        }
+        assert!(!app.show_all);
+        assert_eq!(
+            app.rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+            keys
+        );
+        app.set_query("named shell");
+        assert!(app.rows.is_empty());
+        assert_eq!(app.selected_target(), None);
+    }
+
+    #[test]
+    fn agent_search_keeps_parent_matching_and_selects_by_priority_not_match_score() {
+        let mut app = AppState::new(
+            snapshot(),
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+            View::Agents,
+        );
+        for (query, names) in [
+            ("Project", vec!["reviewer", "notes", "hidden-title"]),
+            ("feature", vec!["reviewer"]),
+            ("Review", vec!["reviewer"]),
+            ("Editor", vec!["notes", "hidden-title"]),
+            ("notes", vec!["notes"]),
+            ("Other", vec![]),
+        ] {
+            app.set_query(query);
+            assert_eq!(
+                app.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                names,
+                "{query}"
+            );
+            assert_eq!(app.selected, 0);
+        }
+        let mut data = snapshot();
+        data.workspaces[0].tabs[0].panes[0].name = Some("t---a---s---k".into());
+        data.workspaces[0].tabs[0].panes[0].status = AgentStatus::Blocked;
+        data.workspaces[1].tabs[0].panes[0].name = Some("task".into());
+        app.update_snapshot(data, &History::default());
+        app.set_query("task");
+        assert_eq!(
+            app.selected_target(),
+            Some(FocusTarget::Pane("named-notes".into()))
+        );
+        assert!(app.rows[0].score < app.rows[1].score);
+    }
+
+    #[test]
+    fn current_agent_is_disabled_context_and_cannot_win_agent_priority_or_mru() {
+        let mut data = snapshot();
+        data.workspaces[0].tabs[0].panes[0].status = AgentStatus::Blocked;
+        let current = origin("named-notes", "editor");
+        let history = History {
+            panes: HashMap::from([("named-notes".into(), 9999), ("unnamed".into(), 100)]),
+            ..History::default()
+        };
+        let mut app = AppState::new(
+            data,
+            &history,
+            current,
+            Keybindings::default(),
+            View::Agents,
+        );
+        assert_eq!(
+            app.selected_target(),
+            Some(FocusTarget::Pane("named-review".into()))
+        );
+        assert_eq!(app.rows.last().unwrap().name, "notes");
+        app.set_query("notes");
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.selected_target(), None);
+        assert_eq!(key(&mut app, KeyCode::Enter), KeyAction::Continue);
+        app.set_query("");
+        assert_eq!(
+            app.selected_target(),
+            Some(FocusTarget::Pane("named-review".into()))
+        );
+    }
+
+    #[test]
+    fn agent_mru_uses_pane_recency_and_ignores_plain_panes_and_parent_history() {
+        let mut data = snapshot();
+        for workspace in &mut data.workspaces {
+            for tab in &mut workspace.tabs {
+                for pane in &mut tab.panes {
+                    pane.status = AgentStatus::Idle;
+                }
+            }
+        }
+        let history = History {
+            panes: HashMap::from([
+                ("named-notes".into(), 20),
+                ("unnamed".into(), 30),
+                ("named-review".into(), 10),
+                ("blank".into(), 9999),
+            ]),
+            workspaces: HashMap::from([("worktree".into(), 99999)]),
+            ..History::default()
+        };
+        let mut app = AppState::new(
+            data.clone(),
+            &history,
+            ActiveLocation::default(),
+            Keybindings::default(),
+            View::Agents,
+        );
+        assert_eq!(
+            app.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["hidden-title", "notes", "reviewer"]
+        );
+        assert_eq!(
+            app.selected_target(),
+            Some(FocusTarget::Pane("unnamed".into()))
+        );
+        app = AppState::new(
+            data,
+            &history,
+            origin("unnamed", "editor"),
+            Keybindings::default(),
+            View::Agents,
+        );
+        assert_eq!(
+            app.selected_target(),
+            Some(FocusTarget::Pane("named-notes".into()))
+        );
+    }
+
+    #[test]
+    fn agent_refresh_preserves_selection_and_updates_identity_names_status_and_time() {
+        let mut data = snapshot();
+        let mut app = AppState::new(
+            data.clone(),
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+            View::Agents,
+        );
+        app.selected = app.rows.iter().position(|r| r.name == "notes").unwrap();
+        data.workspaces[0].name = "Renamed".into();
+        data.workspaces[0].tabs[0].panes[0].name = Some("renamed agent".into());
+        data.workspaces[0].tabs[0].panes[0].working_since_ms = Some(123);
+        data.workspaces[0].tabs[0].panes[1].status = AgentStatus::Blocked;
+        app.update_snapshot(data.clone(), &History::default());
+        assert_eq!(
+            app.selected_target(),
+            Some(FocusTarget::Pane("named-notes".into()))
+        );
+        assert_eq!(app.rows[0].name, "hidden-title");
+        assert_eq!(app.rows[app.selected].working_since_ms, Some(123));
+        assert_eq!(app.rows[app.selected].breadcrumbs[0].name, "Renamed");
+        data.workspaces[0].tabs[0].panes[0].agent = None;
+        app.update_snapshot(data.clone(), &History::default());
+        assert_eq!(
+            app.selected_target(),
+            Some(FocusTarget::Pane("unnamed".into()))
+        );
+        data.workspaces.clear();
+        app.update_snapshot(data, &History::default());
+        assert!(app.rows.is_empty());
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Tab,
+            KeyCode::Enter,
+        ] {
+            assert_eq!(key(&mut app, code), KeyAction::Continue);
+        }
+    }
+
+    #[test]
+    fn orphan_worktree_agents_keep_repository_and_branch_context_and_unicode_search() {
+        let mut data = snapshot();
+        data.workspaces.remove(0);
+        data.workspaces[0].name = "新分支".into();
+        let mut app = AppState::new(
+            data,
+            &History::default(),
+            ActiveLocation::default(),
+            Keybindings::default(),
+            View::Agents,
+        );
+        app.set_query("新分");
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(
+            app.rows[0]
+                .breadcrumbs
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["project-repo", "新分支"]
+        );
+        assert_eq!(app.rows[0].breadcrumbs[1].matches, [0, 1]);
+    }
 
     fn priority_fixture() -> (Snapshot, History) {
         let mut data = snapshot();
@@ -758,6 +1121,7 @@ mod tree_tests {
             &history,
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -787,6 +1151,7 @@ mod tree_tests {
                 pane_id: Some("red-elsewhere".into()),
             },
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(app.rows[0].name, "Project");
         assert_eq!(
@@ -841,6 +1206,7 @@ mod tree_tests {
             &history,
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -852,6 +1218,7 @@ mod tree_tests {
             &history,
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -874,6 +1241,7 @@ mod tree_tests {
             &history,
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.set_query("task");
         assert_eq!(
@@ -902,6 +1270,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.set_query("Project");
         assert_eq!(
@@ -973,6 +1342,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.set_query("matching");
         assert_eq!(app.rows[0].name, "Other");
@@ -999,6 +1369,7 @@ mod tree_tests {
             &history,
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.set_query("yellow");
         assert_eq!(
@@ -1049,6 +1420,7 @@ mod tree_tests {
                     &History::default(),
                     ActiveLocation::default(),
                     Keybindings::default(),
+                    View::Tree,
                 );
                 assert!(!app.show_all);
                 assert_eq!(
@@ -1089,6 +1461,7 @@ mod tree_tests {
                 &History::default(),
                 ActiveLocation::default(),
                 Keybindings::default(),
+                View::Tree,
             );
             let row = app
                 .rows
@@ -1108,6 +1481,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         assert!(!app.rows.iter().any(|r| r.name == "notes"));
         let previous = app.selected_target();
@@ -1140,6 +1514,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -1170,6 +1545,7 @@ mod tree_tests {
                 pane_id: Some("named-review".into()),
             },
             Keybindings::default(),
+            View::Tree,
         );
         app.set_query("reviewer");
         assert_eq!(app.rows[app.selected].name, "reviewer");
@@ -1184,6 +1560,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             names(&app),
@@ -1212,6 +1589,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             names(&app),
@@ -1239,6 +1617,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.set_query("Editor");
         assert_eq!(
@@ -1272,6 +1651,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         app.set_query("notes");
         assert_eq!(
@@ -1305,6 +1685,7 @@ mod tree_tests {
             &history,
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         let previous = app.selected_target();
         key(&mut app, KeyCode::Tab);
@@ -1337,6 +1718,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         for _ in 0..2 {
             for query in ["unnamed", "hidden-title", "blank"] {
@@ -1360,6 +1742,7 @@ mod tree_tests {
             &History::default(),
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         let row = app.rows.iter().find(|r| r.name == "Project").unwrap();
         assert_eq!(
@@ -1392,6 +1775,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         key(&mut app, KeyCode::Tab);
         assert_eq!(
@@ -1411,6 +1795,7 @@ mod tree_tests {
             &History::default(),
             ActiveLocation::default(),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.rows.iter().find(|r| r.name == "feature").unwrap().kind,
@@ -1438,6 +1823,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -1478,6 +1864,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         let parent = app.rows.iter().find(|r| r.name == "Editor").unwrap();
         assert!(parent.target.is_none());
@@ -1500,6 +1887,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -1519,6 +1907,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -1568,6 +1957,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -1592,6 +1982,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -1603,6 +1994,7 @@ mod tree_tests {
             &history,
             origin("unnamed", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -1631,6 +2023,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -1654,6 +2047,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         app.set_query("tests");
         assert_eq!(
@@ -1679,6 +2073,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         assert_eq!(
             app.selected_target(),
@@ -1705,6 +2100,7 @@ mod tree_tests {
             &history,
             origin("named-notes", "editor"),
             Keybindings::default(),
+            View::Tree,
         );
         app.set_query("tests");
         app.update_snapshot(snapshot(), &history);
@@ -1721,7 +2117,7 @@ mod tree_tests {
         current: ActiveLocation,
         keys: Keybindings,
     ) -> AppState {
-        let mut state = AppState::new(data, history, current, keys);
+        let mut state = AppState::new(data, history, current, keys, View::Tree);
         state.toggle_all();
         state
     }

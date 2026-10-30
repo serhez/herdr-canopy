@@ -24,7 +24,7 @@ use crossterm::{
     style::ResetColor,
     terminal,
 };
-use models::{ActiveLocation, FocusTarget, History, KeyAction, Keybindings, Snapshot};
+use models::{ActiveLocation, FocusTarget, History, KeyAction, Keybindings, Snapshot, View};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -92,19 +92,31 @@ fn main() -> Result<()> {
         "Run this plugin inside Herdr, or use --mock to preview it"
     );
     if cli.pane_open {
-        return popup::open(&tracker::session_path("popup", "state"), open_navigator).map(|_| ());
+        return popup::open(
+            &tracker::session_path("popup", "state"),
+            cli.view.entrypoint(),
+            || open_navigator(cli.view),
+        )
+        .map(|_| ());
     }
     if matches!(cli.command, Some(Command::Toggle)) {
-        return popup::toggle(&tracker::session_path("popup", "state"), open_navigator).map(|_| ());
+        return popup::toggle(
+            &tracker::session_path("popup", "state"),
+            cli.view.entrypoint(),
+            || open_navigator(cli.view),
+        )
+        .map(|_| ());
     }
 
-    let _popup = if std::env::var("HERDR_PLUGIN_ENTRYPOINT_ID").as_deref() == Ok("navigator") {
-        Some(popup::PopupState::claim(&tracker::session_path(
-            "popup", "state",
-        ))?)
-    } else {
-        None
-    };
+    let _popup =
+        if std::env::var("HERDR_PLUGIN_ENTRYPOINT_ID").as_deref() == Ok(cli.view.entrypoint()) {
+            Some(popup::PopupState::claim(
+                &tracker::session_path("popup", "state"),
+                cli.view.entrypoint(),
+            )?)
+        } else {
+            None
+        };
 
     let tracker = Tracker::for_session();
     let mock = mock_enabled(&cli);
@@ -125,7 +137,7 @@ fn main() -> Result<()> {
     } else {
         tracker.load()?
     };
-    let mut app = AppState::new(snapshot, &recency, current, load_keybindings()?);
+    let mut app = AppState::new(snapshot, &recency, current, load_keybindings()?, cli.view);
     let selected = run_tui(&mut app, &tracker, !mock, _popup.as_ref())?;
     if let Some(target) = selected
         && !mock
@@ -147,7 +159,7 @@ fn mock_enabled(cli: &Cli) -> bool {
     }
 }
 
-fn open_navigator() -> Result<()> {
+fn open_navigator(view: View) -> Result<()> {
     let plugin_id = std::env::var("HERDR_PLUGIN_ID").unwrap_or_else(|_| PLUGIN_ID.into());
     ipc::cli_request(&[
         "plugin",
@@ -156,7 +168,7 @@ fn open_navigator() -> Result<()> {
         "--plugin",
         &plugin_id,
         "--entrypoint",
-        "navigator",
+        view.entrypoint(),
         "--focus",
     ])?;
     Ok(())
