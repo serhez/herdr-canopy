@@ -97,7 +97,8 @@ herdr plugin action invoke serhez.herdr-canopy.toggle
 
 Canopy keeps one popup per session. Opening a different mode replaces the active
 popup; opening the same mode keeps it open. Both modes share focus history and
-working-time tracking, and use the same 65-column, 30-row popup size.
+working-time tracking. The tree popup is 65 columns × 30 rows; the agents popup
+is 70 columns × 18 rows.
 
 ## Navigation
 
@@ -277,9 +278,10 @@ reporting to receive Command/Super keys and restores the previous mode on exit.
 
 ### Appearance
 
-The popup is **65 columns × 30 rows**. To change its dimensions, edit `width` and
-`height` in the `navigator` pane entry of `herdr-plugin.toml`, then relink the
-plugin. The new size applies the next time you open it.
+The tree popup is **65 columns × 30 rows**, and the agents popup is **70 columns
+× 18 rows**. To change their dimensions, edit `width` and `height` in the
+`navigator` or `agents` pane entry of `herdr-plugin.toml`, then relink the plugin.
+The new size applies the next time you open it.
 
 Colors follow the terminal's ANSI palette and default foreground, with overrides
 from Herdr's `[theme.custom]` settings. The plugin reads `HERDR_CONFIG_PATH`, then
