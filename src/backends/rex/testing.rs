@@ -84,12 +84,19 @@ impl FakeRex {
     }
 
     /// Answers calls routed to `key` with the given output and exit status.
+    /// Each file is replaced whole, so a call made meanwhile reads a complete one.
     pub fn answer_with(&self, key: &str, stdout: &str, stderr: &str, status: i32) {
         // Keys such as `session.select` contain dots, so append rather than replace extensions.
         let file = |ext: &str| self.dir.path().join("answers").join(format!("{key}.{ext}"));
-        fs::write(file("out"), stdout).unwrap();
-        fs::write(file("err"), stderr).unwrap();
-        fs::write(file("status"), status.to_string()).unwrap();
+        for (ext, text) in [
+            ("out", stdout),
+            ("err", stderr),
+            ("status", &status.to_string()),
+        ] {
+            let temp = file(&format!("{ext}.tmp"));
+            fs::write(&temp, text).unwrap();
+            fs::rename(temp, file(ext)).unwrap();
+        }
     }
 
     /// Every call so far, in order.

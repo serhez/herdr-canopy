@@ -436,6 +436,10 @@ Differences from Herdr:
 - States come from status reports (see the limitations below). Waits need an
   agent that reports, so `start` runs only Claude Code and Codex, and
   `prompt --wait` on another agent ends with `agent_prompt_stalled`.
+- `wait` and `prompt --wait` from an agent (`REX_BLOCK` set) refuse, before
+  sending anything, to wait on itself or on an agent that waits on it, directly
+  or through others (`agent_waiting_on_you`): each would stay busy until a
+  timeout. A plain `prompt` is never refused.
 - `prompt` refuses a Claude or Codex in the unknown state (`agent_not_ready`),
   since its input could answer a startup dialog. `start` returns
   `agent_not_ready` when the agent runs but stays silent until the timeout:

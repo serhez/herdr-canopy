@@ -5,12 +5,14 @@
 //! An agent is a terminal block whose processes or status reports name a known
 //! agent (see [`decode`]); its name is the block's label. Prompts, keys and starts
 //! hold a per-block lock in the server's state directory while they write, so two
-//! senders never mix their input in one prompt box.
+//! senders never mix their input in one prompt box. Waits from a block record
+//! themselves there too (see [`waits`]), so a wait that would never end is refused.
 
 use super::bindings::{self, Bindings};
 use super::claude_jobs::{self, Job};
 use super::cli::Rex;
 use super::decode::{self, AgentState, BlockInfo, DecodeContext, TerminalBlock};
+use super::waits;
 use super::watch::Period;
 use super::{FOCUS, Focused, SNAPSHOT, choose_client, state_dir, tracker};
 use crate::cli::{
@@ -77,6 +79,7 @@ impl From<anyhow::Error> for Failure {
 type Reply = Result<Value, Failure>;
 
 /// How the commands reach a Rex server, and Canopy's files about it.
+#[derive(Clone)]
 struct Server {
     rex: Rex,
     /// Canopy's state root; each server has a directory under it.
@@ -85,6 +88,8 @@ struct Server {
     bindings: Option<PathBuf>,
     /// The background agent a silent Claude process shows.
     viewed_job: fn(u32) -> Option<Job>,
+    /// The block the command runs in (`REX_BLOCK`), if any.
+    caller: Option<String>,
 }
 
 /// Runs an agent command and prints its reply.
@@ -98,6 +103,7 @@ pub fn run(args: AgentArgs, state_root: anyhow::Result<PathBuf>) -> ExitCode {
             state_root,
             bindings: bindings::path(env("XDG_STATE_HOME").as_deref(), env("HOME").as_deref()),
             viewed_job: claude_jobs::viewed_job,
+            caller: std::env::var("REX_BLOCK").ok().filter(|b| !b.is_empty()),
         };
         execute(&server, args.command, &|| started.elapsed())
     });
@@ -376,6 +382,42 @@ impl View {
             Found::Refused | Found::Gone => None,
         })
     }
+
+    /// Records that the calling block waits on `block` until the result is
+    /// dropped, unless `block` waits on it: that wait would never end.
+    fn wait_on(
+        &self,
+        server: &Server,
+        block: &TerminalBlock,
+    ) -> Result<Option<waits::Wait>, Failure> {
+        let Some(caller) = &server.caller else {
+            return Ok(None);
+        };
+        let chain = match waits::register(&self.state_dir, caller, &block.block_id)? {
+            Ok(wait) => return Ok(Some(wait)),
+            Err(chain) => chain,
+        };
+        let name = |id: &str| {
+            self.blocks
+                .iter()
+                .find(|b| b.block_id == id)
+                .map_or(id.to_owned(), |b| label(b).to_owned())
+        };
+        let message = match chain.as_slice() {
+            [] | [_] => "an agent cannot wait on itself: it works until the wait ends".to_owned(),
+            [target, between @ .., _] => {
+                let mut message = format!("agent {} waits on you", name(target));
+                if !between.is_empty() {
+                    let names: Vec<String> =
+                        chain[..chain.len() - 1].iter().map(|id| name(id)).collect();
+                    message += &format!(" ({} → you)", names.join(" → "));
+                }
+                message
+                    + ", so this wait would last until a timeout: end your turn with your answer or question, or prompt it without --wait"
+            }
+        };
+        Err(Failure::new("agent_waiting_on_you", message))
+    }
 }
 
 /// How messages name an agent: its name, else its block id.
@@ -535,6 +577,11 @@ fn prompt(server: &Server, args: PromptArgs, elapsed: &dyn Fn() -> Duration) -> 
         _ => {}
     }
     let pid = state.pid.ok_or_else(|| not_running(agent))?;
+    let _waiting = if args.wait {
+        view.wait_on(server, block)?
+    } else {
+        None
+    };
     let input = Input {
         text: &args.text,
         pid,
@@ -574,6 +621,7 @@ fn wait(server: &Server, args: WaitArgs, elapsed: &dyn Fn() -> Duration) -> Repl
     }
     let agent = label(block);
     let pid = state.pid.ok_or_else(|| not_running(agent))?;
+    let _waiting = view.wait_on(server, block)?;
     let goal = Goal {
         until,
         needs_activity: false,
@@ -916,6 +964,7 @@ mod tests {
     use super::*;
     use crate::backends::rex::decode::LiveRecord;
     use crate::backends::rex::testing::{Call, FakeRex};
+    use crate::backends::rex::waits;
     use crate::cli::{Cli, Command, RexCommand};
     use crate::test_helpers::rerun_alone;
     use AgentStatus::{Blocked, Done, Idle, Unknown, Working};
@@ -1016,18 +1065,29 @@ mod tests {
                 state_root: dir.path().join("state"),
                 bindings: Some(bindings),
                 viewed_job: |_| None,
+                caller: None,
             };
             Self { fake, dir, server }
         }
 
+        /// The commands run from block `caller`.
+        fn called_from(mut self, caller: &str) -> Self {
+            self.server.caller = Some(caller.to_owned());
+            self
+        }
+
         /// Runs `herdr-canopy rex agent ARGS…` at the moment it was given.
         fn run(&self, args: &[&str]) -> Reply {
-            let cli =
-                Cli::try_parse_from([&["herdr-canopy", "rex", "agent"], args].concat()).unwrap();
-            let Some(Command::Rex(RexCommand::Agent(agent))) = cli.command else {
-                panic!("not an agent command");
+            execute(&self.server, parse(args), &|| Duration::ZERO)
+        }
+
+        /// [`Self::run`] from block `caller`.
+        fn run_as(&self, caller: &str, args: &[&str]) -> Reply {
+            let server = Server {
+                caller: Some(caller.to_owned()),
+                ..self.server.clone()
             };
-            execute(&self.server, agent.command, &|| Duration::ZERO)
+            execute(&server, parse(args), &|| Duration::ZERO)
         }
 
         fn state_dir(&self) -> PathBuf {
@@ -1042,6 +1102,14 @@ mod tests {
                 .map(script_args)
                 .collect()
         }
+    }
+
+    fn parse(args: &[&str]) -> AgentCommand {
+        let cli = Cli::try_parse_from([&["herdr-canopy", "rex", "agent"], args].concat()).unwrap();
+        let Some(Command::Rex(RexCommand::Agent(agent))) = cli.command else {
+            panic!("not an agent command");
+        };
+        agent.command
     }
 
     fn script_args(call: &Call) -> Value {
@@ -1503,6 +1571,136 @@ mod tests {
             fixture.agent_calls(),
             [json!({"session_id": "session:pad", "block_id": "block:claude", "wait_s": 1.0})]
         );
+    }
+
+    /// Records that block `waiter` waits on block `target`, until dropped.
+    fn waiting(fixture: &Fixture, waiter: &str, target: &str) -> waits::Wait {
+        waits::register(&fixture.state_dir(), waiter, target)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn reviewer_look(state: &str) -> String {
+        let records = json!([record(state, "claude-code", 30)]);
+        looked(info(("claude", 30), &[("zsh", 3)], records), false)
+    }
+
+    #[test]
+    fn waiting_on_an_agent_that_waits_on_you_is_refused_before_anything_is_sent() {
+        let fixture = Fixture::new(&snapshot()).called_from("block:me");
+        let _reviewer = waiting(&fixture, "block:claude", "block:me");
+        for args in [
+            &["wait", "reviewer"][..],
+            &["prompt", "reviewer", "go", "--wait"],
+        ] {
+            let error = fixture.run(args).unwrap_err();
+            assert_eq!(error.code, "agent_waiting_on_you", "{args:?}");
+            assert!(
+                error.message.contains("agent reviewer waits on you"),
+                "{}",
+                error.message
+            );
+        }
+        assert!(
+            fixture.agent_calls().is_empty(),
+            "nothing is sent or looked at"
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_the_agents_through_which_the_target_waits_on_you() {
+        let fixture = Fixture::new(&snapshot()).called_from("block:me");
+        let _held = [
+            waiting(&fixture, "block:claude", "block:gemini"),
+            waiting(&fixture, "block:gemini", "block:me"),
+        ];
+        let error = fixture.run(&["wait", "reviewer"]).unwrap_err();
+        assert_eq!(error.code, "agent_waiting_on_you");
+        assert!(
+            error.message.contains("reviewer → helper → you"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn an_agent_cannot_wait_on_itself() {
+        let fixture = Fixture::new(&snapshot()).called_from("block:claude");
+        for args in [
+            &["wait", "reviewer"][..],
+            &["prompt", "reviewer", "go", "--wait"],
+        ] {
+            assert_eq!(
+                fixture.run(args).unwrap_err().code,
+                "agent_waiting_on_you",
+                "{args:?}"
+            );
+        }
+        assert!(fixture.agent_calls().is_empty());
+    }
+
+    #[test]
+    fn a_prompt_without_wait_reaches_an_agent_that_waits_on_you() {
+        let fixture = Fixture::new(&snapshot()).called_from("block:me");
+        let _reviewer = waiting(&fixture, "block:claude", "block:me");
+        fixture.fake.answer("agent", &reviewer_look("working"));
+        fixture.run(&["prompt", "reviewer", "my answer"]).unwrap();
+        assert_eq!(fixture.agent_calls()[0]["submit"]["text"], "my answer");
+    }
+
+    #[test]
+    fn a_wait_that_is_already_met_is_not_refused() {
+        let fixture = Fixture::new(&snapshot()).called_from("block:me");
+        let _reviewer = waiting(&fixture, "block:claude", "block:me");
+        let reply = fixture
+            .run(&["wait", "reviewer", "--until", "working"])
+            .unwrap();
+        assert_eq!(reply["agent"]["agent_status"], "working");
+    }
+
+    #[test]
+    fn waits_from_outside_a_block_are_not_checked() {
+        let fixture = Fixture::new(&snapshot());
+        let _reviewer = waiting(&fixture, "block:claude", "block:me");
+        fixture.fake.answer("agent", &reviewer_look("idle"));
+        let reply = fixture.run(&["wait", "reviewer"]).unwrap();
+        assert_eq!(reply["agent"]["agent_status"], "idle");
+    }
+
+    #[test]
+    fn a_running_wait_is_seen_by_the_agent_it_waits_on_and_gone_once_it_ends() {
+        let planner = info(
+            ("claude", 70),
+            &[("zsh", 7)],
+            json!([record("working", "claude-code", 70)]),
+        );
+        let data = with_block(snapshot(), 0, "block:me", "planner", planner);
+        let fixture = Fixture::new(&data).called_from("block:me");
+        fixture.fake.answer("agent", &reviewer_look("working"));
+        let waits = fixture.state_dir().join("waits");
+        let entries = || fs::read_dir(&waits).map_or(0, |entries| entries.count());
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let planner_wait = scope.spawn(|| {
+                let args = ["wait", "reviewer", "--timeout", "15000"];
+                execute(&fixture.server, parse(&args), &|| started.elapsed())
+            });
+            while entries() == 0 {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "no wait recorded"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let error = fixture
+                .run_as("block:claude", &["wait", "planner"])
+                .unwrap_err();
+            assert_eq!(error.code, "agent_waiting_on_you", "{}", error.message);
+            fixture.fake.answer("agent", &reviewer_look("idle"));
+            let reply = planner_wait.join().unwrap().unwrap();
+            assert_eq!(reply["agent"]["agent_status"], "idle");
+        });
+        assert_eq!(entries(), 0, "the wait that ended left nothing behind");
     }
 
     #[test]

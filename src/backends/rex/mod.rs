@@ -7,6 +7,7 @@ pub mod claude_jobs;
 pub mod cli;
 pub mod decode;
 pub mod layer;
+pub mod waits;
 pub mod watch;
 
 #[cfg(test)]
