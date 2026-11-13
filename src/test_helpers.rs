@@ -2,7 +2,7 @@ use crate::models::Snapshot;
 use serde_json::json;
 
 pub fn snapshot() -> Snapshot {
-    crate::ipc::decode_snapshot(
+    crate::backends::herdr::ipc::decode_snapshot(
         json!({"workspaces": [
             {"workspace_id":"project","label":"Project","worktree":{"is_linked_worktree":false,"repo_key":"repo","repo_name":"project-repo"}},
             {"workspace_id":"worktree","label":"feature","worktree":{"is_linked_worktree":true,"repo_key":"repo","repo_name":"project-repo"}},

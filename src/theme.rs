@@ -1,6 +1,9 @@
 use ratatui::style::Color;
-use std::path::PathBuf;
 
+/// An RGB color, as a terminal reports it.
+pub type Rgb = (u8, u8, u8);
+
+#[derive(Debug, Clone, Copy)]
 pub struct Palette {
     pub background: Color,
     pub selection: Color,
@@ -37,31 +40,14 @@ impl Default for Palette {
     }
 }
 
-pub fn herdr_config_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("HERDR_CONFIG_PATH")
-        && !path.is_empty()
-    {
-        return Some(path.into());
-    }
-    if let Ok(path) = std::env::var("XDG_CONFIG_HOME")
-        && !path.is_empty()
-    {
-        return Some(PathBuf::from(path).join("herdr/config.toml"));
-    }
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".config/herdr/config.toml"))
-}
-
 impl Palette {
-    pub fn load() -> Self {
-        Self::from_config(
-            &herdr_config_path()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .unwrap_or_default(),
-        )
+    pub fn from_config(text: &str) -> Self {
+        Self::from_config_with(text, Self::default())
     }
 
-    pub fn from_config(text: &str) -> Self {
-        let mut palette = Self::default();
+    /// [`Self::from_config`], with `base`'s colors where the config sets none.
+    pub fn from_config_with(text: &str, base: Palette) -> Self {
+        let mut palette = base;
         let Ok(value) = text.parse::<toml::Value>() else {
             return palette;
         };
@@ -183,6 +169,38 @@ pub fn parse_color(text: &str) -> Option<Color> {
     }
 }
 
+/// The color in a terminal's reply to the OSC `code` query (`10` for text,
+/// `11` for background, `4;N` for palette color N): `ESC ] code ; rgb:R/G/B`,
+/// with 1 to 4 hex digits a channel.
+pub fn osc_color(reply: &str, code: &str) -> Option<Rgb> {
+    let start = format!("\x1b]{code};rgb:");
+    let rest = &reply[reply.find(&start)? + start.len()..];
+    let body = &rest[..rest.find(['\x1b', '\x07'])?];
+    let mut channels = body.split('/').map(|hex| {
+        let digits = u32::try_from(hex.len())
+            .ok()
+            .filter(|n| (1..=4).contains(n))?;
+        let value = u32::from_str_radix(hex, 16).ok()?;
+        let max = 16u32.pow(digits) - 1;
+        u8::try_from((value * 255 + max / 2) / max).ok()
+    });
+    let rgb = (channels.next()??, channels.next()??, channels.next()??);
+    channels.next().is_none().then_some(rgb)
+}
+
+/// `background` moved by `amount` (0 to 1) of the way toward `toward`.
+pub fn lift(background: Rgb, toward: Rgb, amount: f64) -> Color {
+    let channel = |from: u8, to: u8| {
+        let moved = f64::from(from) + (f64::from(to) - f64::from(from)) * amount;
+        moved.round().clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(
+        channel(background.0, toward.0),
+        channel(background.1, toward.1),
+        channel(background.2, toward.2),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +260,58 @@ teal = "#41FFDC"
             }
             _ => panic!("expected a darker RGB background"),
         }
+    }
+
+    #[test]
+    fn a_host_chooses_the_colors_used_where_none_are_configured() {
+        let base = Palette {
+            background: Color::Reset,
+            selection: Color::Rgb(1, 2, 3),
+            ..Palette::default()
+        };
+        let p = Palette::from_config_with("", Palette { ..base });
+        assert_eq!(p.background, Color::Reset);
+        assert_eq!(p.selection, Color::Rgb(1, 2, 3));
+        assert_eq!(p.accent, Color::Cyan);
+        let p = Palette::from_config_with(
+            "[theme.custom]\nsidebar_bg = \"#171B20\"\nactive_row_bg = \"#2C313A\"",
+            base,
+        );
+        assert_eq!(p.background, Color::Rgb(23, 27, 32));
+        assert_eq!(p.selection, Color::Rgb(44, 49, 58));
+    }
+
+    #[test]
+    fn terminal_color_replies_are_read_in_any_precision() {
+        let reply = "\x1b]10;rgb:e7e7/eded/f3f3\x1b\\\x1b]11;rgb:0e/11/17\x07\x1b[?62;22c";
+        assert_eq!(osc_color(reply, "10"), Some((0xe7, 0xed, 0xf3)));
+        assert_eq!(osc_color(reply, "11"), Some((0x0e, 0x11, 0x17)));
+        assert_eq!(
+            osc_color("\x1b]11;rgb:f/0/8\x07", "11"),
+            Some((255, 0, 136))
+        );
+        assert_eq!(osc_color(reply, "12"), None, "not asked");
+        assert_eq!(osc_color("\x1b]11;rgb:zz/11/17\x07", "11"), None);
+        assert_eq!(osc_color("\x1b]11;rgb:0e/11\x07", "11"), None);
+        let palette = "\x1b]4;1;rgb:f7/3b/61\x1b\\\x1b]4;16;rgb:ffff/9898/5858\x1b\\";
+        assert_eq!(
+            osc_color(palette, "4;16"),
+            Some((255, 152, 88)),
+            "a palette color"
+        );
+        assert_eq!(osc_color(palette, "4;1"), Some((247, 59, 97)));
+    }
+
+    #[test]
+    fn a_lift_moves_the_background_toward_the_text() {
+        let (text, background) = ((231, 234, 238), (29, 34, 40));
+        assert_eq!(lift(background, text, 0.08), Color::Rgb(45, 50, 56));
+        assert_eq!(lift(background, text, 0.0), Color::Rgb(29, 34, 40));
+        // A light theme lifts downward.
+        assert_eq!(
+            lift((250, 250, 250), (0, 0, 0), 0.1),
+            Color::Rgb(225, 225, 225)
+        );
     }
 
     #[test]

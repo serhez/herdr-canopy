@@ -16,7 +16,7 @@ pub fn render(frame: &mut Frame, app: &AppState, palette: &Palette) {
         frame,
         app,
         palette,
-        crate::tracker::unix_millis().unwrap_or_default(),
+        crate::history::unix_millis().unwrap_or_default(),
     );
 }
 

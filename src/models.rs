@@ -1,6 +1,8 @@
+use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum View {
@@ -14,6 +16,22 @@ impl View {
         match self {
             Self::Tree => "navigator",
             Self::Agents => "agents",
+        }
+    }
+
+    /// The popup's title, as in Herdr's plugin manifest.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Tree => "Canopy",
+            Self::Agents => "Canopy Agents",
+        }
+    }
+
+    /// The popup's size in cells (columns, rows), as in Herdr's plugin manifest.
+    pub fn default_size(self) -> (u16, u16) {
+        match self {
+            Self::Tree => (65, 30),
+            Self::Agents => (70, 18),
         }
     }
 }
@@ -71,6 +89,8 @@ impl History {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub workspaces: Vec<Workspace>,
+    /// A non-fatal problem to show in the navigator (Herdr: always `None`).
+    pub notice: Option<String>,
 }
 
 impl Snapshot {
@@ -121,6 +141,14 @@ impl Snapshot {
             }
         }
         location
+    }
+
+    /// Adds a non-fatal problem to show, after any already there.
+    pub fn add_notice(&mut self, notice: &str) {
+        self.notice = Some(match self.notice.take() {
+            Some(previous) => format!("{previous}; {notice}"),
+            None => notice.to_owned(),
+        });
     }
 
     pub fn exclude_pane(&mut self, pane_id: &str) {
@@ -238,7 +266,7 @@ impl AgentProvider {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Blocked,
@@ -337,6 +365,24 @@ impl Default for Keybindings {
 }
 
 impl Keybindings {
+    /// The `[keybindings]` table of a TOML settings file; defaults when the file
+    /// or the table is missing.
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let settings: toml::Value = text
+                    .parse()
+                    .with_context(|| format!("Invalid settings: {}", path.display()))?;
+                settings
+                    .get("keybindings")
+                    .map(|value| value.clone().try_into().context("Invalid keybindings"))
+                    .unwrap_or_else(|| Ok(Self::default()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn matches(bindings: &[String], event: KeyEvent) -> bool {
         bindings.iter().any(|binding| {
             parse_key(binding).is_some_and(|parsed| {
@@ -457,5 +503,28 @@ mod location_tests {
         let location = data.active_location(None);
         assert_eq!(location.pane_id.as_deref(), Some("named-notes"));
         assert_eq!(location.tab_id.as_deref(), Some("editor"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_view_keeps_the_title_and_size_of_its_herdr_popup() {
+        let manifest: toml::Value = include_str!("../herdr-plugin.toml").parse().unwrap();
+        let panes = manifest["panes"].as_array().unwrap();
+        for view in [View::Tree, View::Agents] {
+            let pane = panes
+                .iter()
+                .find(|pane| pane["id"].as_str() == Some(view.entrypoint()))
+                .unwrap();
+            assert_eq!(Some(view.title()), pane["title"].as_str());
+            let size = (
+                pane["width"].as_integer().unwrap() as u16,
+                pane["height"].as_integer().unwrap() as u16,
+            );
+            assert_eq!(view.default_size(), size);
+        }
     }
 }

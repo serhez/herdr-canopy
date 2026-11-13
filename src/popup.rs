@@ -68,8 +68,15 @@ fn owner(path: &Path) -> Result<String> {
     Ok(text)
 }
 
-fn wait_until(mut ready: impl FnMut() -> Result<bool>, message: &str) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+/// How long a popup may take to start or to close by default.
+pub const TIMEOUT: Duration = Duration::from_secs(5);
+
+fn wait_until(
+    timeout: Duration,
+    mut ready: impl FnMut() -> Result<bool>,
+    message: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
     while !ready()? {
         anyhow::ensure!(Instant::now() < deadline, "{message}");
         std::thread::sleep(Duration::from_millis(10));
@@ -78,17 +85,21 @@ fn wait_until(mut ready: impl FnMut() -> Result<bool>, message: &str) -> Result<
 }
 
 pub fn toggle(path: &Path, view: &str, open: impl FnOnce() -> Result<()>) -> Result<bool> {
-    change(path, view, true, open)
+    change(path, view, true, TIMEOUT, open)
 }
 
 pub fn open(path: &Path, view: &str, spawn: impl FnOnce() -> Result<()>) -> Result<bool> {
-    change(path, view, false, spawn)
+    change(path, view, false, TIMEOUT, spawn)
 }
 
-fn change(
+/// Toggles (`toggle`) or opens the popup for `view`, waiting up to `timeout`
+/// for an old popup to close and a new one to claim the lock. Returns whether a
+/// popup is open afterwards.
+pub fn change(
     path: &Path,
     view: &str,
     toggle: bool,
+    timeout: Duration,
     spawn: impl FnOnce() -> Result<()>,
 ) -> Result<bool> {
     let action = lock_file(&path.with_extension("action.lock"))?;
@@ -96,14 +107,14 @@ fn change(
     if is_open(path)? {
         let token = owner(path)?;
         let same_view = token
-            .split_once(':')
+            .rsplit_once(':')
             .is_none_or(|(active, _)| active == view);
         if !toggle && same_view {
             return Ok(true);
         }
         anyhow::ensure!(!token.is_empty(), "Navigator is still starting");
         fs::write(path.with_extension("close"), token)?;
-        wait_until(|| Ok(!is_open(path)?), "Navigator did not close")?;
+        wait_until(timeout, || Ok(!is_open(path)?), "Navigator did not close")?;
         if same_view {
             return Ok(false);
         }
@@ -111,6 +122,7 @@ fn change(
     let previous = owner(path).unwrap_or_default();
     spawn()?;
     wait_until(
+        timeout,
         || {
             let token = owner(path)?;
             // A new token proves the popup has claimed the lock; probing sooner can block startup.
@@ -315,5 +327,23 @@ mod tests {
         fs::write(path.with_extension("close"), "next").unwrap();
         handle.into_inner().unwrap().unwrap().join().unwrap();
         assert_eq!(token, "next");
+    }
+
+    #[test]
+    fn view_keys_containing_colons_are_compared_whole() {
+        // Rex view keys embed window ids such as `window:a`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("popup");
+        let handles = Mutex::new(Vec::new());
+        let (here, there) = ("navigator@window:a", "navigator@window:b");
+        assert!(toggle(&path, here, || fake_view(&path, &handles, here)).unwrap());
+        assert!(open(&path, here, || panic!("same key open keeps the popup")).unwrap());
+        assert!(toggle(&path, there, || fake_view(&path, &handles, there)).unwrap());
+        assert!(owner(&path).unwrap().starts_with("navigator@window:b:"));
+        assert!(!toggle(&path, there, || panic!("same key toggle closes")).unwrap());
+        for handle in handles.into_inner().unwrap() {
+            handle.join().unwrap();
+        }
+        assert!(!is_open(&path).unwrap());
     }
 }

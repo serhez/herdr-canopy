@@ -4,8 +4,8 @@ use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::time::Duration;
 
+use super::working::WorkingTracker;
 use crate::models::{ActiveLocation, AgentActivity, FocusTarget, Pane, Snapshot, Tab, Workspace};
-use crate::tracker::WorkingTracker;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
@@ -136,7 +136,10 @@ pub fn decode_snapshot(workspaces: Value, tabs: Value, panes: Value) -> Result<S
             workspaces[i].tabs.push(tab);
         }
     }
-    Ok(Snapshot { workspaces })
+    Ok(Snapshot {
+        workspaces,
+        notice: None,
+    })
 }
 
 pub fn focus(target: &FocusTarget) -> Result<()> {
