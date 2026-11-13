@@ -917,6 +917,7 @@ mod tests {
     use crate::backends::rex::decode::LiveRecord;
     use crate::backends::rex::testing::{Call, FakeRex};
     use crate::cli::{Cli, Command, RexCommand};
+    use crate::test_helpers::rerun_alone;
     use AgentStatus::{Blocked, Done, Idle, Unknown, Working};
     use clap::Parser;
     use fs2::FileExt;
@@ -1844,20 +1845,19 @@ mod tests {
 
     #[test]
     fn input_to_a_block_waits_for_its_last_sender_only() {
+        if rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let held = input_lock(dir.path(), "block:a").unwrap();
         let other = File::open(dir.path().join("input/block:a.lock")).unwrap();
         assert!(other.try_lock_exclusive().is_err(), "held by the sender");
         drop(input_lock(dir.path(), "block:b").unwrap());
         drop(held);
-        // A process another test forks meanwhile shares the lock until it execs.
-        let freed = (0..200).any(|_| {
-            other.try_lock_exclusive().is_ok() || {
-                std::thread::sleep(Duration::from_millis(10));
-                false
-            }
-        });
-        assert!(freed, "free once the sender is done");
+        assert!(
+            other.try_lock_exclusive().is_ok(),
+            "free once the sender is done"
+        );
         for id in ["", "../x", "a/b", ".hidden"] {
             assert!(input_lock(dir.path(), id).is_err(), "{id}");
         }

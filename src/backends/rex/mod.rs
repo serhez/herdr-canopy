@@ -747,6 +747,7 @@ fn start_watcher(launch: &Launch, state_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::popup::{self, PopupState};
+    use crate::test_helpers::rerun_alone;
     use ratatui::style::Color;
     use serde_json::{Value, json};
     use std::thread;
@@ -1193,6 +1194,9 @@ mod tests {
 
     #[test]
     fn a_toggle_opens_a_centred_popup_in_the_origin_window_then_closes_it() {
+        if rerun_alone() {
+            return;
+        }
         let fake = FakeRex::new();
         let dir = tempfile::tempdir().unwrap();
         prepare_answer(&fake, "window:a1");
@@ -1239,6 +1243,9 @@ mod tests {
 
     #[test]
     fn a_measured_frame_shapes_the_popup_which_learns_against_the_same_window() {
+        if rerun_alone() {
+            return;
+        }
         let fake = FakeRex::new();
         let dir = tempfile::tempdir().unwrap();
         prepare_answer(&fake, "window:a1");
@@ -1271,6 +1278,9 @@ mod tests {
 
     #[test]
     fn an_origin_without_pixel_sizes_gets_a_popup_sized_in_cells_that_learns_nothing() {
+        if rerun_alone() {
+            return;
+        }
         let fake = FakeRex::new();
         let dir = tempfile::tempdir().unwrap();
         let answer = json!({"host_id": HOST, "window_id": "window:a1", "rect": [0, 0, 1, 1],
@@ -1542,6 +1552,9 @@ mod tests {
 
     #[test]
     fn the_popup_uses_the_state_dir_its_launcher_chose() {
+        if rerun_alone() {
+            return;
+        }
         let fake = FakeRex::new();
         let dir = tempfile::tempdir().unwrap();
         prepare_answer(&fake, "window:a1");
@@ -1582,6 +1595,9 @@ mod tests {
 
     #[test]
     fn a_toggle_from_another_window_or_session_moves_the_popup_there() {
+        if rerun_alone() {
+            return;
+        }
         let fake = FakeRex::new();
         let dir = tempfile::tempdir().unwrap();
         prepare_answer(&fake, "window:a1");
@@ -1610,6 +1626,9 @@ mod tests {
 
     #[test]
     fn open_keeps_the_popup_already_open_in_the_same_window() {
+        if rerun_alone() {
+            return;
+        }
         let fake = FakeRex::new();
         let dir = tempfile::tempdir().unwrap();
         prepare_answer(&fake, "window:a1");
@@ -1629,6 +1648,9 @@ mod tests {
 
     #[test]
     fn the_agents_view_and_custom_sizes_shape_the_popup() {
+        if rerun_alone() {
+            return;
+        }
         let fake = FakeRex::new();
         let dir = tempfile::tempdir().unwrap();
         prepare_answer(&fake, "window:a1");
@@ -1649,6 +1671,9 @@ mod tests {
 
     #[test]
     fn a_popup_that_never_starts_has_its_layer_closed() {
+        if rerun_alone() {
+            return;
+        }
         let fake = FakeRex::new();
         let dir = tempfile::tempdir().unwrap();
         prepare_answer(&fake, "window:a1");
@@ -1664,6 +1689,9 @@ mod tests {
 
     #[test]
     fn opening_a_popup_starts_a_missing_watcher() {
+        if rerun_alone() {
+            return;
+        }
         let fake = FakeRex::new();
         let dir = tempfile::tempdir().unwrap();
         prepare_answer(&fake, "window:a1");

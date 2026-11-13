@@ -136,6 +136,7 @@ pub fn change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::rerun_alone;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -169,6 +170,9 @@ mod tests {
 
     #[test]
     fn changing_modes_replaces_the_popup_and_same_mode_toggle_closes_it() {
+        if rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("popup");
         let handles = Mutex::new(Vec::new());
@@ -199,6 +203,9 @@ mod tests {
 
     #[test]
     fn simultaneous_different_modes_share_one_popup_and_serialize_the_switch() {
+        if rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("popup");
         let handles = Mutex::new(Vec::new());
@@ -223,6 +230,9 @@ mod tests {
 
     #[test]
     fn toggle_opens_once_then_closes_the_same_popup() {
+        if rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("popup");
         let handles = Mutex::new(Vec::new());
@@ -241,6 +251,9 @@ mod tests {
 
     #[test]
     fn simultaneous_toggles_do_not_spawn_two_popups() {
+        if rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("popup");
         let handles = Arc::new(Mutex::new(Vec::new()));
@@ -267,6 +280,9 @@ mod tests {
 
     #[test]
     fn stale_close_request_cannot_close_a_new_popup() {
+        if rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("popup");
         let first = PopupState::claim(&path, "navigator").unwrap();
@@ -286,6 +302,9 @@ mod tests {
 
     #[test]
     fn opening_failure_does_not_leave_a_false_open_marker() {
+        if rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("popup");
         assert!(toggle(&path, "navigator", || anyhow::bail!("cannot open")).is_err());
@@ -331,6 +350,9 @@ mod tests {
 
     #[test]
     fn view_keys_containing_colons_are_compared_whole() {
+        if rerun_alone() {
+            return;
+        }
         // Rex view keys embed window ids such as `window:a`.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("popup");

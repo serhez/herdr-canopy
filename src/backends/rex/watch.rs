@@ -508,6 +508,7 @@ fn stop(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::rerun_alone;
     use serde_json::{Value, json};
     use std::thread;
     use std::time::Instant;
@@ -763,6 +764,9 @@ mod tests {
 
     #[test]
     fn one_watcher_per_server_and_a_rebuilt_binary_takes_over() {
+        if rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let wait = Duration::from_secs(2);
         assert!(!is_running(dir.path()).unwrap());
