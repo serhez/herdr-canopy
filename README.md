@@ -405,7 +405,7 @@ come from the `sizes` option. State lives in
 `~/.local/state/herdr-canopy/rex-<server id>/`.
 
 Linked worktrees nest under their main checkout when
-[worktree-sync](https://github.com/serhez/herdr-worktree-sync) has bound the
+[worktree-sync](https://github.com/serhez/worktree-sync) has bound the
 sessions. Canopy reads its bindings file read-only.
 
 ### Agent commands
