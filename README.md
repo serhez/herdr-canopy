@@ -443,7 +443,8 @@ Differences from Herdr:
 - `prompt` refuses a Claude or Codex in the unknown state (`agent_not_ready`),
   since its input could answer a startup dialog. `start` returns
   `agent_not_ready` when the agent runs but stays silent until the timeout:
-  read its screen, and answer the dialog with `send-keys`.
+  read its screen, and answer the dialog with `send-keys`. A failed `start` ends
+  its message with the last lines of the block's screen.
 - `read` gives text only, with no `ansi` format or `detection` source, and does
   not recover an agent's own scrolled-off history. There is no `attach` or
   `explain`.

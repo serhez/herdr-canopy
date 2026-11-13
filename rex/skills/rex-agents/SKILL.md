@@ -61,8 +61,8 @@ Only one agent per checkout should change files. When done, close its pane
 (`rex block close -s SESSION BLOCK`), or remove its worktree once the work is
 merged or saved (`worktree-sync rex remove --session SESSION --yes
 --no-switch`, which ends its agents). Leave other agents and worktrees alone
-unless asked. If `start` fails, `read` the block (a startup dialog or shell
-question). Skill `rex` covers the rest of Rex.
+unless asked. A failed `start` shows the block's last lines. Skill `rex`
+covers the rest of Rex.
 
 Ask the user before answering an approval, trust or hooks prompt, unless more
 specific instructions (the user's or a skill's) say otherwise.

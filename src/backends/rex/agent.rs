@@ -47,6 +47,8 @@ const REPORTING: [&str; 2] = ["claude", "codex"];
 const SHELLS: [&str; 7] = ["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish"];
 const START_TIMEOUT_MS: u64 = 30_000;
 const START_TIMEOUTS_MS: std::ops::RangeInclusive<u64> = 3_001..=300_000;
+/// Lines of text from the block's screen that a failed `start` shows.
+const START_SCREEN_LINES: usize = 8;
 const NAME_RULE: &str = "agent name must start with a lowercase letter and contain only \
                          lowercase letters, digits, '-' or '_' (1-32 characters)";
 
@@ -939,8 +941,27 @@ fn start(server: &Server, args: StartArgs, elapsed: &dyn Fn() -> Duration) -> Re
         kind,
         shell_pid,
         Duration::from_millis(timeout_ms),
-    )?;
+    )
+    .map_err(|failure| with_screen(server, &named, failure))?;
     Ok(json!({"type": "agent_started", "agent": view.info(&ready.block), "argv": argv}))
+}
+
+/// `failure` followed by the last lines of `block`'s screen, which show why the
+/// typed command started no agent: a dialog, a shell error, or a question the
+/// shell asked when it started.
+fn with_screen(server: &Server, block: &TerminalBlock, mut failure: Failure) -> Failure {
+    let capture = ["capture", "-s", &block.session_id, "-b", &block.block_id];
+    if let Ok(output) = server.rex.output(&capture) {
+        let lines: Vec<&str> = lines_of(&output, false)
+            .into_iter()
+            .filter(|line| !line.is_empty())
+            .collect();
+        if !lines.is_empty() {
+            let (text, _) = last_lines(&lines, START_SCREEN_LINES);
+            failure.message += &format!("\n\nIts screen ends with:\n{text}");
+        }
+    }
+    failure
 }
 
 /// `arg` as one word for a POSIX shell, or for fish, where backslashes in single
@@ -2020,6 +2041,57 @@ mod tests {
             ])
             .unwrap_err();
         assert_eq!(failure.code, "agent_pane_busy");
+    }
+
+    /// A start of Claude in the shell block that ends with Claude blocked at a
+    /// question, while the block's screen is `capture`.
+    fn failed_start(capture: Result<&str, &str>) -> (Fixture, Failure) {
+        let fixture = Fixture::new(&snapshot());
+        fixture.fake.answer("block", "");
+        let mut blocked = record("blocked", "claude-code", 70);
+        blocked["kind"] = json!("question");
+        let look = info(("claude", 70), &[("zsh", 4)], json!([blocked]));
+        fixture.fake.answer("agent", &looked(look, false));
+        match capture {
+            Ok(screen) => fixture.fake.answer("capture", screen),
+            Err(error) => fixture.fake.answer_with("capture", "", error, 1),
+        }
+        let failure = fixture
+            .run(&[
+                "start",
+                "coder",
+                "--kind",
+                "claude",
+                "--pane",
+                "block:shell",
+            ])
+            .unwrap_err();
+        (fixture, failure)
+    }
+
+    #[test]
+    fn a_failed_start_ends_its_message_with_the_end_of_the_blocks_screen() {
+        let screen: Vec<String> = (1..=10).map(|n| format!("line {n}   ")).collect();
+        let (fixture, failure) = failed_start(Ok(&format!("{}\n\n\n", screen.join("\n\n"))));
+        assert_eq!(failure.code, "agent_not_ready");
+        let (reason, screen) = failure.message.split_once("\n\n").unwrap();
+        assert!(reason.contains("blocked at startup"), "{reason}");
+        assert_eq!(
+            screen,
+            "Its screen ends with:\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10",
+            "its last 8 lines with text, without padding"
+        );
+        assert_eq!(
+            argv(&fixture.fake.calls_to("capture")[0]),
+            ["capture", "-s", "session:pad", "-b", "block:shell"]
+        );
+    }
+
+    #[test]
+    fn a_failed_start_whose_screen_cannot_be_read_keeps_its_message() {
+        let (_, failure) = failed_start(Err("no such block"));
+        assert_eq!(failure.code, "agent_not_ready");
+        assert!(!failure.message.contains('\n'), "{}", failure.message);
     }
 
     #[test]
