@@ -18,8 +18,9 @@ pub struct DecodeContext<'a> {
     pub periods: &'a HashMap<String, Period>,
     /// The navigator's own block, never listed.
     pub exclude_block: Option<&'a str>,
-    /// The background agent a Claude process without status records shows, by pid.
-    pub viewed_job: &'a dyn Fn(u32) -> Option<Job>,
+    /// The background agent a Claude process without status records shows, by
+    /// pid and the block's title.
+    pub viewed_job: &'a dyn Fn(u32, Option<&str>) -> Option<Job>,
 }
 
 /// Lua encodes an empty array as `{}`; accept that, `null` and arrays.
@@ -222,11 +223,12 @@ impl BlockInfo {
     /// The block's agent, from live status records or its foreground process, and
     /// its status. A record is live while its owner is the foreground process or
     /// one of its ancestors. `seen_ms` is when the user last focused the block;
-    /// `viewed_job` gives the background agent a silent Claude process shows.
+    /// `viewed_job` gives the background agent a silent Claude process shows, by
+    /// its pid and the block's title.
     pub fn agent_state(
         &self,
         seen_ms: Option<u64>,
-        viewed_job: &dyn Fn(u32) -> Option<Job>,
+        viewed_job: &dyn Fn(u32, Option<&str>) -> Option<Job>,
     ) -> Option<AgentState> {
         let foreground = self.process.foreground.as_ref();
         let live_pids = self.pids();
@@ -292,7 +294,8 @@ impl BlockInfo {
                 // Claude background agent, which never reports here.
                 let pid = foreground.and_then(|p| p.pid);
                 let job = if agent == "claude" {
-                    pid.and_then(viewed_job)
+                    let title = self.title.as_ref().and_then(|t| t.title.as_deref());
+                    pid.and_then(|pid| viewed_job(pid, title))
                 } else {
                     None
                 };
@@ -591,7 +594,7 @@ mod tests {
     use crate::backends::rex::claude_jobs::Job;
     use crate::models::{AgentProvider, AgentStatus, Pane};
     use serde_json::json;
-    use std::cell::Cell;
+    use std::cell::RefCell;
 
     const TERMINAL: &str = "com.superlogical.terminal";
     /// Rex's `updated_at` for the records below, and the same instant in ms.
@@ -658,7 +661,7 @@ mod tests {
     }
 
     /// No Claude pane shows a background agent unless a test says otherwise.
-    fn no_job(_pid: u32) -> Option<Job> {
+    fn no_job(_pid: u32, _title: Option<&str>) -> Option<Job> {
         None
     }
 
@@ -678,7 +681,7 @@ mod tests {
     fn decode_viewing(
         raw: &Value,
         history: &History,
-        viewed_job: &dyn Fn(u32) -> Option<Job>,
+        viewed_job: &dyn Fn(u32, Option<&str>) -> Option<Job>,
     ) -> Snapshot {
         decode(
             raw,
@@ -914,6 +917,7 @@ mod tests {
     fn job(state: &str, updated_ms: Option<u64>, message: Option<&str>) -> Job {
         Job {
             state: state.into(),
+            tempo: None,
             updated_ms,
             message: message.map(String::from),
         }
@@ -943,9 +947,9 @@ mod tests {
             ),
             (None, AgentStatus::Unknown),
         ] {
-            let asked = Cell::new(None);
-            let data = decode_viewing(&silent, &History::default(), &|pid| {
-                asked.set(Some(pid));
+            let asked = RefCell::new(None);
+            let data = decode_viewing(&silent, &History::default(), &|pid, title| {
+                *asked.borrow_mut() = Some((pid, title.map(String::from)));
                 shown.clone()
             });
             let shown_pane = pane(&data, "block:a2");
@@ -954,13 +958,18 @@ mod tests {
                 (Some("claude"), expected),
                 "{shown:?}"
             );
-            assert_eq!(asked.get(), Some(20), "asks about the foreground process");
+            assert_eq!(
+                asked.take(),
+                Some((20, Some("claude.exe title".to_string()))),
+                "asks about the foreground process and the block's title"
+            );
         }
     }
 
     #[test]
     fn only_claude_processes_without_live_records_are_looked_up() {
-        let never = |pid: u32| -> Option<Job> { panic!("looked up pid {pid}") };
+        let never =
+            |pid: u32, _title: Option<&str>| -> Option<Job> { panic!("looked up pid {pid}") };
         // block:a3 is Claude with a live record; block:a2 a silent Codex.
         let data = with_block("block:a2", info(("codex", 20), &[], json!({})));
         let snapshot = decode_viewing(&data, &History::default(), &never);
@@ -978,7 +987,7 @@ mod tests {
         let status = |state: &str, updated_ms: Option<u64>, history: &History| {
             let shown = job(state, updated_ms, None);
             pane(
-                &decode_viewing(&silent, history, &|_| Some(shown.clone())),
+                &decode_viewing(&silent, history, &|_, _| Some(shown.clone())),
                 "block:a2",
             )
             .status
@@ -1014,7 +1023,7 @@ mod tests {
     fn an_agents_state_names_its_process_and_what_it_reports() {
         let state_of = |block: Value, job: Option<Job>| {
             block_info(block)
-                .agent_state(None, &|_| job.clone())
+                .agent_state(None, &|_, _| job.clone())
                 .unwrap()
         };
         let reported = |state: &str| {

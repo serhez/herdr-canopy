@@ -89,7 +89,7 @@ struct Server {
     /// worktree-sync's bindings file.
     bindings: Option<PathBuf>,
     /// The background agent a silent Claude process shows.
-    viewed_job: fn(u32) -> Option<Job>,
+    viewed_job: fn(u32, Option<&str>) -> Option<Job>,
     /// The block the command runs in (`REX_BLOCK`), if any.
     caller: Option<String>,
 }
@@ -1085,7 +1085,7 @@ mod tests {
                 rex: Rex::new(fake.path.clone()),
                 state_root: dir.path().join("state"),
                 bindings: Some(bindings),
-                viewed_job: |_| None,
+                viewed_job: |_, _| None,
                 caller: None,
             };
             Self { fake, dir, server }

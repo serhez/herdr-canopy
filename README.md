@@ -467,11 +467,14 @@ ln -s "$PWD/rex/skills/rex-agents" ~/.claude/skills/rex-agents
   them this means starting up or waiting at a startup dialog, such as a folder
   trust or hooks prompt.
 - A Claude background agent runs in Claude's own daemon, so a pane viewing it
-  reports nothing. For `claude attach ID`, Canopy reads the agent's state from
-  Claude's job file (`$CLAUDE_CONFIG_DIR/jobs/ID/state.json`, by default under
-  `~/.claude`). It shows as unknown when attached by name instead of id, when
-  that file cannot be read, and in the `claude agents` view. Such agents have
-  no working timer.
+  (`claude attach`, or the `claude agents` view) reports nothing. Canopy reads
+  its state from Claude's job file (`$CLAUDE_CONFIG_DIR/jobs/ID/state.json`, by
+  default under `~/.claude`): the file of the one job whose name is the pane's
+  title, else, for `claude attach ID`, of job ID. Claude counts such an agent as
+  blocked at a dialog and also when its last reply ends on a question or request
+  for the user, so `prompt` refuses it then; and as working while it waits on
+  its background tasks. It shows as unknown in the `claude agents` list and when
+  its file cannot be read. Such agents have no working timer.
 - Rex reports neither the window's size nor its pane frame (header and
   padding), so Canopy estimates the window from the pane it opens from and
   learns the frame from each popup. The first popup on a server, or after a

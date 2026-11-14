@@ -233,7 +233,7 @@ impl Watch {
         now_ms: u64,
     ) -> Vec<Effect> {
         // Only live records are timed, so Claude's job files are not read here.
-        let state = info.agent_state(None, &|_| None);
+        let state = info.agent_state(None, &|_, _| None);
         let status = state.as_ref().map_or(AgentStatus::Unknown, |s| s.status);
         let record = state.as_ref().and_then(|s| s.record);
         let owner_pid = record.map(|r| r.owner_pid);
