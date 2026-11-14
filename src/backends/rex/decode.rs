@@ -19,7 +19,7 @@ pub struct DecodeContext<'a> {
     /// The navigator's own block, never listed.
     pub exclude_block: Option<&'a str>,
     /// The background agent a Claude process without status records shows, by
-    /// pid and the block's title.
+    /// pid and the block's title, if that process set it.
     pub viewed_job: &'a dyn Fn(u32, Option<&str>) -> Option<Job>,
 }
 
@@ -115,6 +115,8 @@ struct Process {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 struct Title {
     title: Option<String>,
+    /// The process that set the title.
+    owner: Option<Owner>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -195,14 +197,16 @@ pub struct AgentState {
     pub pid: Option<u32>,
     /// What the agent says it is doing or asking.
     pub message: Option<String>,
-    /// What a blocked agent waits for (`permission`, `question`, `auth`).
+    /// What a blocked agent waits for (`permission`, `question`, `auth`; for a
+    /// Claude background agent, [`super::claude_jobs::REPLY`]).
     pub blocked_kind: Option<String>,
+    /// When the record or background agent that decided `status` last changed.
+    pub updated_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveRecord {
     pub owner_pid: u32,
-    pub updated_ms: Option<u64>,
     /// `done` or `error`: cleared to idle once the user looked at the block.
     pub clears_when_seen: bool,
 }
@@ -224,7 +228,7 @@ impl BlockInfo {
     /// its status. A record is live while its owner is the foreground process or
     /// one of its ancestors. `seen_ms` is when the user last focused the block;
     /// `viewed_job` gives the background agent a silent Claude process shows, by
-    /// its pid and the block's title.
+    /// its pid and the block's title, if that process set it.
     pub fn agent_state(
         &self,
         seen_ms: Option<u64>,
@@ -270,7 +274,6 @@ impl BlockInfo {
             if best.is_none_or(|(b, _, _)| status.priority() > b.priority()) {
                 let live = LiveRecord {
                     owner_pid,
-                    updated_ms,
                     clears_when_seen,
                 };
                 best = Some((status, live, record));
@@ -287,6 +290,7 @@ impl BlockInfo {
                     .kind
                     .clone()
                     .filter(|_| status == AgentStatus::Blocked),
+                updated_ms: record.updated_at.as_deref().and_then(parse_time_ms),
             },
             None => {
                 // Agents that report at all report idle once ready, so silence means
@@ -294,8 +298,14 @@ impl BlockInfo {
                 // Claude background agent, which never reports here.
                 let pid = foreground.and_then(|p| p.pid);
                 let job = if agent == "claude" {
-                    let title = self.title.as_ref().and_then(|t| t.title.as_deref());
-                    pid.and_then(|pid| viewed_job(pid, title))
+                    pid.and_then(|pid| {
+                        let title = self
+                            .title
+                            .as_ref()
+                            .filter(|t| t.owner.as_ref().and_then(|o| o.pid) == Some(pid))
+                            .and_then(|t| t.title.as_deref());
+                        viewed_job(pid, title)
+                    })
                 } else {
                     None
                 };
@@ -306,13 +316,18 @@ impl BlockInfo {
                         Some(unless_seen(status, clears, seen_ms, job.updated_ms))
                     })
                     .unwrap_or(AgentStatus::Unknown);
+                let job = job.as_ref();
                 AgentState {
                     agent,
                     status,
                     record: None,
                     pid,
-                    message: job.and_then(|job| job.message),
-                    blocked_kind: None,
+                    message: job.and_then(|job| job.message.clone()),
+                    blocked_kind: job
+                        .and_then(|job| job.blocked_kind)
+                        .filter(|_| status == AgentStatus::Blocked)
+                        .map(String::from),
+                    updated_ms: job.and_then(|job| job.updated_ms),
                 }
             }
         };
@@ -591,7 +606,7 @@ pub fn parse_time_ms(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::rex::claude_jobs::Job;
+    use crate::backends::rex::claude_jobs::{Job, REPLY};
     use crate::models::{AgentProvider, AgentStatus, Pane};
     use serde_json::json;
     use std::cell::RefCell;
@@ -920,7 +935,56 @@ mod tests {
             tempo: None,
             updated_ms,
             message: message.map(String::from),
+            blocked_kind: None,
         }
+    }
+
+    #[test]
+    fn only_a_title_the_claude_process_set_names_the_job_it_shows() {
+        // Before Claude sets its title, the block keeps the one the shell set.
+        let mut by_shell = info(("claude.exe", 20), &[("zsh", 11)], json!({}));
+        by_shell["title"] = json!({"title": "Pilot plan", "owner": {"name": "zsh", "pid": 11}});
+        let mut unowned = by_shell.clone();
+        unowned["title"] = json!({"title": "Pilot plan"});
+        for block in [by_shell, unowned] {
+            let asked = RefCell::new(None);
+            decode_viewing(
+                &with_block("block:a2", block),
+                &History::default(),
+                &|pid, title| {
+                    *asked.borrow_mut() = Some((pid, title.map(String::from)));
+                    None
+                },
+            );
+            assert_eq!(asked.take(), Some((20, None)));
+        }
+    }
+
+    #[test]
+    fn a_background_agent_waiting_on_its_reply_says_so() {
+        let state_of = |job: Job| {
+            block_info(info(("claude", 20), &[("zsh", 11)], json!({})))
+                .agent_state(None, &|_, _| Some(job.clone()))
+                .unwrap()
+        };
+        let mut question = job("blocked", Some(AT_MS), Some("Go ahead?"));
+        question.blocked_kind = Some(REPLY);
+        let waiting = state_of(question.clone());
+        assert_eq!(
+            (
+                waiting.status,
+                waiting.blocked_kind.as_deref(),
+                waiting.updated_ms
+            ),
+            (AgentStatus::Blocked, Some(REPLY), Some(AT_MS))
+        );
+        question.tempo = Some("active".into());
+        let answered = state_of(question);
+        assert_eq!(
+            (answered.status, answered.blocked_kind),
+            (AgentStatus::Working, None),
+            "only a blocked agent has a blocked kind"
+        );
     }
 
     #[test]
@@ -1038,9 +1102,15 @@ mod tests {
             (
                 blocked.pid,
                 blocked.message.as_deref(),
-                blocked.blocked_kind.as_deref()
+                blocked.blocked_kind.as_deref(),
+                blocked.updated_ms
             ),
-            (Some(30), Some("Allow cargo test?"), Some("permission"))
+            (
+                Some(30),
+                Some("Allow cargo test?"),
+                Some("permission"),
+                Some(AT_MS)
+            )
         );
         let working = state_of(reported("working"), None);
         assert_eq!(

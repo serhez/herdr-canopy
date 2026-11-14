@@ -1,17 +1,24 @@
 //! The background agent a Claude Code pane shows. Claude's background agents run
-//! in its own daemon, outside any terminal, so a pane viewing one (`claude
-//! attach ID`, or the `claude agents` view) reports no program status. Claude
-//! keeps each agent's state in `<config>/jobs/<id>/state.json` (config:
-//! `$CLAUDE_CONFIG_DIR`, else `~/.claude`). That file is Claude's internal
-//! format: when it is missing or unreadable, the pane's state is unknown.
+//! in its own daemon, outside any terminal, so a pane viewing one reports no
+//! program status: `claude attach ID`, the `claude agents` view, and a Claude
+//! session the user moved to the background, whose process stays to show it.
+//! Claude keeps each agent's state in `<config>/jobs/<id>/state.json` and each
+//! of its processes' in `<config>/sessions/<pid>.json` (config:
+//! `$CLAUDE_CONFIG_DIR`, else `~/.claude`). Those files are Claude's internal
+//! format: when they are missing or unreadable, the pane's state is unknown.
 
 use super::decode::{parse_time_ms, strip_title};
 use crate::models::AgentStatus;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// A background agent's state, as Claude's job file records it.
+/// The blocked kind of a background agent waiting only on the question or
+/// request its last reply ended on: an ordinary prompt answers it.
+pub const REPLY: &str = "reply";
+
+/// A background agent's state, as Claude's files record it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     /// Claude's job state, set when a turn ends: `working` (it continues on
@@ -24,6 +31,8 @@ pub struct Job {
     pub updated_ms: Option<u64>,
     /// What the agent needs from the user, else what it is doing.
     pub message: Option<String>,
+    /// What a blocked agent waits for: [`REPLY`], else unknown.
+    pub blocked_kind: Option<&'static str>,
 }
 
 impl Job {
@@ -48,60 +57,112 @@ impl Job {
     }
 }
 
-/// The job Claude process `pid`, in a block titled `title`, shows.
+/// The job Claude process `pid` shows; `title` is its block's title, if the
+/// process set it.
 pub fn viewed_job(pid: u32, title: Option<&str>) -> Option<Job> {
-    let jobs = jobs_dir(
+    let config = config_dir(
         std::env::var_os("CLAUDE_CONFIG_DIR"),
         std::env::var_os("HOME").map(PathBuf::from),
     )?;
-    shown_job(&process_args(pid)?, title, &jobs)
-}
-
-/// Claude's jobs folder for its config directory setting and the home folder.
-fn jobs_dir(config_dir: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
-    let config = match config_dir.filter(|dir| !dir.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => home?.join(".claude"),
+    let parked = || {
+        let file = config.join("sessions").join(format!("{pid}.json"));
+        read_json::<Process>(&file)?.parked_job_id
     };
-    Some(config.join("jobs"))
+    shown_job(&process_args(pid)?, parked, title, &config)
 }
 
-/// The job a `claude attach ID` or `claude agents` process shows. Both views
-/// can move between jobs and title the block with the shown job's name, so the
-/// one job of that name; else, for `claude attach ID`, job ID. Claude also
-/// accepts part of a session name in place of the id; Canopy reads ids only.
-fn shown_job(args: &[String], title: Option<&str>, jobs: &Path) -> Option<Job> {
-    let attached = match args {
-        [_, command, rest @ ..] if command == "attach" => rest.first(),
+/// Claude's config directory for its setting and the home folder.
+fn config_dir(setting: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    match setting.filter(|dir| !dir.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => Some(home?.join(".claude")),
+    }
+}
+
+/// The job a Claude process with arguments `args` shows: `claude attach ID`
+/// opens job ID, `claude agents` the list of jobs, and a session moved to the
+/// background `parked()`, the job its process file names (read for other
+/// commands only). Each view can move between jobs and titles its block with
+/// the shown job's name, so a `title` decides alone: the one job of that name.
+/// Claude also accepts part of a session name in place of the id; Canopy
+/// reads ids only.
+fn shown_job(
+    args: &[String],
+    parked: impl FnOnce() -> Option<String>,
+    title: Option<&str>,
+    config: &Path,
+) -> Option<Job> {
+    let opened = match args {
+        [_, command, rest @ ..] if command == "attach" => rest.first().cloned(),
         [_, command, ..] if command == "agents" => None,
-        _ => return None,
+        _ => Some(parked()?),
     };
-    title
-        .and_then(|title| named_job(&strip_title(title), jobs))
-        .or_else(|| {
-            let id = attached?;
-            let is_id = !id.is_empty()
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-            if !is_id {
-                return None;
-            }
-            StateFile::read(&jobs.join(id).join("state.json")).map(StateFile::into_job)
-        })
+    let jobs = config.join("jobs");
+    let (id, file) = match title {
+        Some(title) => named_job(&strip_title(title), &jobs)?,
+        None => {
+            let id = opened.filter(|id| {
+                !id.is_empty()
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })?;
+            let file = read_json(&jobs.join(&id).join("state.json"))?;
+            (id, file)
+        }
+    };
+    Some(file.into_job(&id, &config.join("sessions")))
 }
 
-/// The only job named `name`, if exactly one is.
-fn named_job(name: &str, jobs: &Path) -> Option<Job> {
+/// The only job named `name`, with its id, if exactly one is.
+fn named_job(name: &str, jobs: &Path) -> Option<(String, StateFile)> {
     if name.is_empty() {
         return None;
     }
-    let mut named = std::fs::read_dir(jobs)
-        .ok()?
-        .filter_map(|entry| StateFile::read(&entry.ok()?.path().join("state.json")))
-        .filter(|file| file.name.as_deref() == Some(name));
+    let mut named = std::fs::read_dir(jobs).ok()?.filter_map(|entry| {
+        let entry = entry.ok()?;
+        let file: StateFile = read_json(&entry.path().join("state.json"))?;
+        if file.name.as_deref() != Some(name) {
+            return None;
+        }
+        Some((entry.file_name().into_string().ok()?, file))
+    });
     let job = named.next()?;
-    named.next().is_none().then(|| job.into_job())
+    named.next().is_none().then_some(job)
+}
+
+/// Whether Claude processes run job `id` and all are at rest, idle or idle
+/// with background shells: none shows a dialog or runs a turn. Not when a
+/// process file cannot be read, since its process might.
+fn at_rest(id: &str, sessions: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(sessions) else {
+        return false;
+    };
+    let mut found = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Some(process) = read_json::<Process>(&path) else {
+            return false;
+        };
+        if process.job_id.as_deref() == Some(id) {
+            if !matches!(process.status.as_deref(), Some("idle" | "shell")) {
+                return false;
+            }
+            found = true;
+        }
+    }
+    found
+}
+
+/// The JSON file at `path`, if it can be read as a `T`.
+fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
 /// The fields Canopy reads from a job's state file.
@@ -117,19 +178,39 @@ struct StateFile {
 }
 
 impl StateFile {
-    /// The state file at `path`, if it can be read.
-    fn read(path: &Path) -> Option<Self> {
-        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
-    }
-
-    fn into_job(self) -> Job {
-        Job {
+    /// The job `id`, whose processes' files are in `sessions`.
+    fn into_job(self, id: &str, sessions: &Path) -> Job {
+        let mut job = Job {
             state: self.state,
             tempo: self.tempo,
             updated_ms: self.updated_at.as_deref().and_then(parse_time_ms),
             message: self.needs.or(self.detail),
+            blocked_kind: None,
+        };
+        // Claude marks a job blocked both at a dialog, where typed text could
+        // pick an option, and once its last reply ended on a question; only
+        // then are its processes at rest.
+        if job.state == "blocked"
+            && job.status() == Some((AgentStatus::Blocked, false))
+            && at_rest(id, sessions)
+        {
+            job.blocked_kind = Some(REPLY);
         }
+        job
     }
+}
+
+/// The fields Canopy reads from a Claude process's file.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Process {
+    /// The job a background agent's process runs.
+    job_id: Option<String>,
+    /// The job a session moved to the background became.
+    parked_job_id: Option<String>,
+    /// `idle`, `busy` (a turn runs), `waiting` (a dialog is open), `shell`
+    /// (idle with background shells), …
+    status: Option<String>,
 }
 
 /// A process's arguments, `argv[0]` first.
@@ -209,19 +290,36 @@ mod tests {
         list.iter().map(|a| a.to_string()).collect()
     }
 
-    /// A jobs folder holding the given jobs, as (id, state file) pairs.
-    fn jobs(files: &[(&str, &str)]) -> tempfile::TempDir {
-        let jobs = tempfile::tempdir().unwrap();
-        for (id, state_file) in files {
-            fs::create_dir(jobs.path().join(id)).unwrap();
-            fs::write(jobs.path().join(id).join("state.json"), state_file).unwrap();
+    /// A Claude config directory holding the given jobs, as (id, state file)
+    /// pairs, and process files, as (file name, contents) pairs.
+    fn config(jobs: &[(&str, &str)], processes: &[(&str, &str)]) -> tempfile::TempDir {
+        let config = tempfile::tempdir().unwrap();
+        for (id, state_file) in jobs {
+            let dir = config.path().join("jobs").join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("state.json"), state_file).unwrap();
         }
-        jobs
+        let sessions = config.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for (name, contents) in processes {
+            fs::write(sessions.join(name), contents).unwrap();
+        }
+        config
     }
 
-    /// A jobs folder holding one job, `8bb03a8b`, with the given state file.
+    fn jobs(files: &[(&str, &str)]) -> tempfile::TempDir {
+        config(files, &[])
+    }
+
+    /// A config directory holding one job, `8bb03a8b`, with the given state file.
     fn jobs_with(state_file: &str) -> tempfile::TempDir {
         jobs(&[("8bb03a8b", state_file)])
+    }
+
+    /// The job shown by a process with arguments `list`, which is not a
+    /// session moved to the background.
+    fn shown(list: &[&str], title: Option<&str>, config: &Path) -> Option<Job> {
+        shown_job(&args(list), || None, title, config)
     }
 
     const WORKING: &str = r#"{"state": "working", "detail": "awaiting a subagent", "tempo": "idle",
@@ -242,6 +340,7 @@ mod tests {
             tempo: tempo.map(String::from),
             updated_ms,
             message: message.map(String::from),
+            blocked_kind: None,
         }
     }
 
@@ -258,20 +357,28 @@ mod tests {
         job("blocked", Some("blocked"), None, Some("Should I go ahead?"))
     }
 
+    /// The file of a background agent's process running `job`.
+    fn worker(job: &str, status: &str) -> String {
+        format!(
+            r#"{{"pid": 60649, "sessionId": "1364", "kind": "bg", "jobId": "{job}",
+                "status": "{status}", "name": "Pilot plan"}}"#
+        )
+    }
+
     #[test]
     fn an_attach_pane_shows_the_job_its_argument_names() {
-        let jobs = jobs_with(WORKING);
+        let config = jobs_with(WORKING);
         for list in [
             ["claude", "attach", "8bb03a8b"],
             ["/opt/homebrew/bin/claude.exe", "attach", "8bb03a8b"],
         ] {
             assert_eq!(
-                shown_job(&args(&list), None, jobs.path()),
+                shown(&list, None, config.path()),
                 Some(working()),
                 "{list:?}"
             );
         }
-        let attach = args(&["claude", "attach", "8bb03a8b"]);
+        let attach = ["claude", "attach", "8bb03a8b"];
         for (file, expected) in [
             (r#"{"state": "blocked"}"#, job("blocked", None, None, None)),
             (
@@ -279,9 +386,9 @@ mod tests {
                 job("blocked", None, None, Some("Should I go ahead?")),
             ),
         ] {
-            let jobs = jobs_with(file);
+            let config = jobs_with(file);
             assert_eq!(
-                shown_job(&attach, None, jobs.path()),
+                shown(&attach, None, config.path()),
                 Some(expected),
                 "{file}"
             );
@@ -290,7 +397,7 @@ mod tests {
 
     #[test]
     fn an_attach_pane_whose_job_cannot_be_read_shows_no_job() {
-        let jobs = jobs_with(WORKING);
+        let config = jobs_with(WORKING);
         for list in [
             vec!["claude", "attach"],
             // Part of a session name works in place of the id; Canopy only reads ids.
@@ -300,7 +407,7 @@ mod tests {
             vec!["claude", "attach", "8bb03a8b/.."],
             vec!["claude", "attach", ""],
         ] {
-            assert_eq!(shown_job(&args(&list), None, jobs.path()), None, "{list:?}");
+            assert_eq!(shown(&list, None, config.path()), None, "{list:?}");
         }
         for broken in [
             "",
@@ -308,9 +415,9 @@ mod tests {
             r#"{"detail": "no state"}"#,
             r#"{"state": 3}"#,
         ] {
-            let jobs = jobs_with(broken);
+            let config = jobs_with(broken);
             assert_eq!(
-                shown_job(&args(&["claude", "attach", "8bb03a8b"]), None, jobs.path()),
+                shown(&["claude", "attach", "8bb03a8b"], None, config.path()),
                 None,
                 "{broken:?}"
             );
@@ -319,8 +426,8 @@ mod tests {
 
     #[test]
     fn an_agents_pane_shows_the_job_its_title_names() {
-        let jobs = jobs(&[("8bb03a8b", WORKING), ("17f1a30e", PLAN)]);
-        let agents = args(&["claude", "agents"]);
+        let config = jobs(&[("8bb03a8b", WORKING), ("17f1a30e", PLAN)]);
+        let agents = ["claude", "agents"];
         for (title, expected) in [
             ("Pilot plan", Some(plan())),
             // Claude puts its activity glyph before the name while it shows a job.
@@ -332,81 +439,106 @@ mod tests {
             ("", None),
         ] {
             assert_eq!(
-                shown_job(&agents, Some(title), jobs.path()),
+                shown(&agents, Some(title), config.path()),
                 expected,
                 "{title:?}"
             );
         }
-        assert_eq!(shown_job(&agents, None, jobs.path()), None, "no title");
-        let with_options = args(&["claude", "agents", "--cwd", "/repo"]);
+        assert_eq!(shown(&agents, None, config.path()), None, "no title");
+        let with_options = ["claude", "agents", "--cwd", "/repo"];
         assert_eq!(
-            shown_job(&with_options, Some("Pilot plan"), jobs.path()),
+            shown(&with_options, Some("Pilot plan"), config.path()),
             Some(plan())
         );
     }
 
     #[test]
-    fn an_attach_pane_shows_the_job_its_title_names_else_its_argument() {
-        // The view can move from the attached job to another one.
-        let jobs = jobs(&[("8bb03a8b", WORKING), ("17f1a30e", PLAN)]);
-        let attach = args(&["claude", "attach", "8bb03a8b"]);
+    fn a_title_decides_the_shown_job_alone() {
+        // The view can move from the job it opened to another one, or to the list.
+        let config = jobs(&[("8bb03a8b", WORKING), ("17f1a30e", PLAN)]);
+        let attach = ["claude", "attach", "8bb03a8b"];
         assert_eq!(
-            shown_job(&attach, Some("✳ Pilot plan"), jobs.path()),
+            shown(&attach, Some("✳ Pilot plan"), config.path()),
             Some(plan())
         );
         assert_eq!(
-            shown_job(
+            shown(
                 &attach,
                 Some("1 awaiting input · claude agents"),
-                jobs.path()
+                config.path()
             ),
-            Some(working())
+            None
+        );
+        assert_eq!(
+            shown(&attach, None, config.path()),
+            Some(working()),
+            "without a title, the job it opened"
         );
     }
 
     #[test]
     fn a_title_that_names_several_jobs_names_none() {
-        let jobs = jobs(&[
+        let config = jobs(&[
             ("8bb03a8b", WORKING),
             ("17f1a30e", PLAN),
             ("3a235eae", PLAN),
         ]);
-        assert_eq!(
-            shown_job(
-                &args(&["claude", "agents"]),
-                Some("Pilot plan"),
-                jobs.path()
-            ),
-            None
-        );
-        assert_eq!(
-            shown_job(
-                &args(&["claude", "attach", "8bb03a8b"]),
-                Some("Pilot plan"),
-                jobs.path()
-            ),
-            Some(working())
-        );
+        for list in [&["claude", "agents"][..], &["claude", "attach", "8bb03a8b"]] {
+            assert_eq!(
+                shown(list, Some("Pilot plan"), config.path()),
+                None,
+                "{list:?}"
+            );
+        }
     }
 
     #[test]
     fn unreadable_jobs_do_not_hide_the_job_a_title_names() {
-        let jobs = jobs(&[("8bb03a8b", "not json"), ("17f1a30e", PLAN)]);
-        fs::create_dir(jobs.path().join("2d72cc03")).unwrap();
-        fs::write(jobs.path().join("pins.json"), "[]").unwrap();
+        let config = jobs(&[("8bb03a8b", "not json"), ("17f1a30e", PLAN)]);
+        let jobs = config.path().join("jobs");
+        fs::create_dir(jobs.join("2d72cc03")).unwrap();
+        fs::write(jobs.join("pins.json"), "[]").unwrap();
         assert_eq!(
-            shown_job(
-                &args(&["claude", "agents"]),
-                Some("Pilot plan"),
-                jobs.path()
-            ),
+            shown(&["claude", "agents"], Some("Pilot plan"), config.path()),
             Some(plan())
         );
     }
 
     #[test]
-    fn only_attach_and_agents_panes_show_a_job() {
-        let jobs = jobs(&[("8bb03a8b", WORKING), ("17f1a30e", PLAN)]);
+    fn a_session_moved_to_the_background_shows_its_job() {
+        // Its process stays, showing the job, and its file names the job.
+        let config = jobs(&[("8bb03a8b", WORKING), ("17f1a30e", PLAN)]);
+        let resumed = args(&["claude", "--resume", "849245af"]);
+        let parked = |id: &str| {
+            let id = id.to_string();
+            move || Some(id)
+        };
+        assert_eq!(
+            shown_job(&resumed, parked("8bb03a8b"), None, config.path()),
+            Some(working())
+        );
+        assert_eq!(
+            shown_job(
+                &resumed,
+                parked("8bb03a8b"),
+                Some("◑ Pilot plan"),
+                config.path()
+            ),
+            Some(plan()),
+            "a title decides"
+        );
+        for id in ["../8bb03a8b", "", "2d72cc03"] {
+            assert_eq!(
+                shown_job(&resumed, parked(id), None, config.path()),
+                None,
+                "{id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_job_views_and_sessions_moved_to_the_background_show_a_job() {
+        let config = jobs(&[("8bb03a8b", WORKING), ("17f1a30e", PLAN)]);
         for list in [
             vec!["claude"],
             vec!["claude", "--resume", "8bb03a8b"],
@@ -415,11 +547,119 @@ mod tests {
             vec!["claude", "--model", "opus", "fix the attach command"],
         ] {
             assert_eq!(
-                shown_job(&args(&list), Some("Pilot plan"), jobs.path()),
+                shown(&list, Some("Pilot plan"), config.path()),
                 None,
                 "{list:?}"
             );
         }
+        let unread = || -> Option<String> { panic!("a job view's process file was read") };
+        for list in [&["claude", "agents"][..], &["claude", "attach", "8bb03a8b"]] {
+            shown_job(&args(list), unread, Some("Pilot plan"), config.path());
+        }
+    }
+
+    #[test]
+    fn process_files_name_the_job_a_process_runs_or_moved_to() {
+        let read = |contents: &str| {
+            let config = config(&[], &[("65434.json", contents)]);
+            read_json::<Process>(&config.path().join("sessions/65434.json"))
+                .map(|p| (p.job_id, p.parked_job_id, p.status))
+        };
+        assert_eq!(
+            read(
+                r#"{"pid": 65434, "sessionId": "849245af", "kind": "interactive", "name": "config-af",
+                    "status": "busy", "parkedJobId": "15e317d6"}"#
+            ),
+            Some((None, Some("15e317d6".into()), Some("busy".into())))
+        );
+        assert_eq!(
+            read(&worker("15e317d6", "idle")),
+            Some((Some("15e317d6".into()), None, Some("idle".into())))
+        );
+        assert_eq!(read("not json"), None);
+    }
+
+    /// The blocked kind of job `8bb03a8b`, with state file `state_file`, for
+    /// the given process files.
+    fn blocked_kind(state_file: &str, processes: &[(&str, &str)]) -> Option<&'static str> {
+        let config = config(&[("8bb03a8b", state_file)], processes);
+        shown(&["claude", "attach", "8bb03a8b"], None, config.path())
+            .unwrap()
+            .blocked_kind
+    }
+
+    #[test]
+    fn a_job_whose_reply_ended_on_a_question_waits_for_a_prompt() {
+        // Its turn ended, so its processes are at rest; at a dialog they wait.
+        let idle = worker("8bb03a8b", "idle");
+        let shell = worker("8bb03a8b", "shell");
+        let others = worker("17f1a30e", "waiting");
+        let parked = r#"{"pid": 65434, "kind": "interactive", "status": "busy",
+                         "parkedJobId": "8bb03a8b"}"#;
+        for processes in [
+            vec![("60649.json", idle.as_str())],
+            vec![("60649.json", shell.as_str())],
+            vec![
+                ("60649.json", idle.as_str()),
+                ("60650.json", shell.as_str()),
+            ],
+            vec![
+                ("60649.json", idle.as_str()),
+                ("94957.json", others.as_str()),
+            ],
+            vec![("60649.json", idle.as_str()), ("65434.json", parked)],
+            vec![
+                ("60649.json", idle.as_str()),
+                ("60649.0da5f5ce.key", "not json"),
+            ],
+        ] {
+            assert_eq!(blocked_kind(PLAN, &processes), Some(REPLY), "{processes:?}");
+        }
+        let undated = r#"{"state": "blocked"}"#;
+        assert_eq!(
+            blocked_kind(undated, &[("60649.json", &idle)]),
+            Some(REPLY),
+            "without a tempo, the state decides"
+        );
+    }
+
+    #[test]
+    fn a_job_at_a_dialog_or_whose_processes_cannot_be_read_waits_for_something_unknown() {
+        let idle = worker("8bb03a8b", "idle");
+        let waiting = worker("8bb03a8b", "waiting");
+        let busy = worker("8bb03a8b", "busy");
+        let no_status = r#"{"pid": 60649, "kind": "bg", "jobId": "8bb03a8b"}"#;
+        for processes in [
+            vec![("60649.json", waiting.as_str())],
+            vec![("60649.json", busy.as_str())],
+            vec![("60649.json", no_status)],
+            vec![],
+            vec![
+                ("60649.json", idle.as_str()),
+                ("60650.json", waiting.as_str()),
+            ],
+            vec![("60649.json", idle.as_str()), ("60650.json", "{\"pid\": 6")],
+        ] {
+            assert_eq!(blocked_kind(PLAN, &processes), None, "{processes:?}");
+        }
+        for state_file in [
+            // A dialog during a turn that follows a working one.
+            r#"{"state": "working", "tempo": "blocked"}"#,
+            // A prompt arrived: the turn runs.
+            r#"{"state": "blocked", "tempo": "active"}"#,
+            r#"{"state": "failed", "tempo": "idle"}"#,
+            r#"{"state": "done"}"#,
+        ] {
+            assert_eq!(
+                blocked_kind(state_file, &[("60649.json", &idle)]),
+                None,
+                "{state_file}"
+            );
+        }
+        let config = jobs_with(PLAN);
+        fs::remove_dir(config.path().join("sessions")).unwrap();
+        let shown = shown(&["claude", "attach", "8bb03a8b"], None, config.path());
+        assert_eq!(shown.unwrap().blocked_kind, None, "no process files");
     }
 
     #[test]
@@ -471,22 +711,22 @@ mod tests {
     }
 
     #[test]
-    fn the_jobs_folder_is_in_claudes_config_directory() {
+    fn claudes_config_directory_is_its_setting_else_in_the_home_folder() {
         let home = Some(PathBuf::from("/Users/me"));
         assert_eq!(
-            jobs_dir(None, home.clone()),
-            Some(PathBuf::from("/Users/me/.claude/jobs"))
+            config_dir(None, home.clone()),
+            Some(PathBuf::from("/Users/me/.claude"))
         );
         assert_eq!(
-            jobs_dir(Some("/etc/claude".into()), home.clone()),
-            Some(PathBuf::from("/etc/claude/jobs"))
+            config_dir(Some("/etc/claude".into()), home.clone()),
+            Some(PathBuf::from("/etc/claude"))
         );
         assert_eq!(
-            jobs_dir(Some("".into()), home),
-            Some(PathBuf::from("/Users/me/.claude/jobs")),
+            config_dir(Some("".into()), home),
+            Some(PathBuf::from("/Users/me/.claude")),
             "an empty setting is unset"
         );
-        assert_eq!(jobs_dir(None, None), None);
+        assert_eq!(config_dir(None, None), None);
     }
 
     #[test]

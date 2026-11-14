@@ -245,6 +245,10 @@ impl Look {
             .as_ref()
             .map_or(AgentStatus::Unknown, |agent| agent.status)
     }
+
+    fn updated_ms(&self) -> Option<u64> {
+        self.block.agent.as_ref().and_then(|agent| agent.updated_ms)
+    }
 }
 
 impl View {
@@ -558,8 +562,12 @@ fn prompt(server: &Server, args: PromptArgs, elapsed: &dyn Fn() -> Duration) -> 
     let view = server.load()?;
     let (block, state) = view.resolve(&args.target)?;
     let agent = label(block);
+    // A Claude background agent whose last reply ended on a question waits for
+    // a prompt, though Claude counts it as blocked.
+    let answers_reply =
+        state.record.is_none() && state.blocked_kind.as_deref() == Some(claude_jobs::REPLY);
     match state.status {
-        AgentStatus::Blocked => {
+        AgentStatus::Blocked if !answers_reply => {
             let waiting = state.blocked_kind.as_deref().unwrap_or("input");
             return Err(Failure::new(
                 "agent_blocked",
@@ -605,6 +613,7 @@ fn prompt(server: &Server, args: PromptArgs, elapsed: &dyn Fn() -> Duration) -> 
         let goal = Goal {
             until: until_or_settled(args.until),
             needs_activity: state.status != AgentStatus::Working,
+            answers: (state.status == AgentStatus::Blocked).then_some(state.updated_ms),
             timeout: args.timeout.map(Duration::from_millis),
         };
         wait_until(&mut observe, elapsed, pid, &goal, agent)?
@@ -627,6 +636,7 @@ fn wait(server: &Server, args: WaitArgs, elapsed: &dyn Fn() -> Duration) -> Repl
     let goal = Goal {
         until,
         needs_activity: false,
+        answers: None,
         timeout: args.timeout.map(Duration::from_millis),
     };
     let mut observe = |wait: Duration| view.observe(server, block, wait);
@@ -647,6 +657,9 @@ struct Goal {
     until: Vec<AgentStatus>,
     /// Whether the agent must first work or block, within [`STALL`].
     needs_activity: bool,
+    /// For a prompt to a blocked agent, when its block last changed: the agent
+    /// shows that block until it reacts, so only a later one counts as blocking.
+    answers: Option<Option<u64>>,
     /// Since the command was given.
     timeout: Option<Duration>,
 }
@@ -695,7 +708,12 @@ fn wait_until(
             .filter(|look| look.block.pids.contains(&pid))
             .ok_or_else(|| not_running(agent))?;
         let status = look.status();
-        active |= look.active || matches!(status, AgentStatus::Working | AgentStatus::Blocked);
+        active |= look.active
+            || match status {
+                AgentStatus::Working => true,
+                AgentStatus::Blocked => goal.answers.is_none_or(|at| look.updated_ms() > at),
+                _ => false,
+            };
         if active && goal.until.contains(&status) {
             return Ok(look);
         }
@@ -1509,6 +1527,51 @@ mod tests {
         );
     }
 
+    /// A Claude background agent whose last reply ended on a question.
+    fn asking(_pid: u32, _title: Option<&str>) -> Option<Job> {
+        Some(Job {
+            state: "blocked".into(),
+            tempo: Some("blocked".into()),
+            updated_ms: Some(100),
+            message: Some("Should I go ahead?".into()),
+            blocked_kind: Some(claude_jobs::REPLY),
+        })
+    }
+
+    /// A Claude background agent at a dialog.
+    fn at_dialog(pid: u32, title: Option<&str>) -> Option<Job> {
+        Some(Job {
+            message: Some("approve Bash: rm -r build".into()),
+            blocked_kind: None,
+            ..asking(pid, title)?
+        })
+    }
+
+    #[test]
+    fn a_background_agent_waiting_on_its_reply_takes_a_prompt_unlike_one_at_a_dialog() {
+        let mut silent = snapshot();
+        silent["sessions"][0]["blocks"]["block:claude"]["status"]["records"] = json!({});
+        let mut fixture = Fixture::new(&silent);
+        fixture.server.viewed_job = at_dialog;
+        let refused = fixture.run(&["prompt", "reviewer", "Yes"]).unwrap_err();
+        assert_eq!(refused.code, "agent_blocked");
+        assert!(fixture.agent_calls().is_empty(), "nothing is sent");
+        fixture.server.viewed_job = asking;
+        fixture.fake.answer(
+            "agent",
+            &looked(info(("claude", 30), &[("zsh", 3)], json!({})), false),
+        );
+        let reply = fixture.run(&["prompt", "reviewer", "Yes"]).unwrap();
+        assert_eq!(reply["agent"]["blocked_kind"], "reply");
+        assert_eq!(
+            fixture.agent_calls(),
+            [
+                json!({"session_id": "session:pad", "block_id": "block:claude", "wait_s": 0.0,
+                    "submit": {"text": "Yes", "pid": 30, "at_prompt": false}})
+            ]
+        );
+    }
+
     #[test]
     fn agents_that_never_report_take_prompts_while_unknown() {
         let fixture = Fixture::new(&snapshot());
@@ -2172,14 +2235,21 @@ mod tests {
             status,
             record: reported.then_some(LiveRecord {
                 owner_pid: pid,
-                updated_ms: None,
                 clears_when_seen: false,
             }),
             pid: Some(pid),
             message: None,
             blocked_kind: None,
+            updated_ms: None,
         });
         block
+    }
+
+    /// A view of a Claude background agent in `status`, last changed at `updated_ms`.
+    fn background(status: AgentStatus, updated_ms: Option<u64>) -> Option<Look> {
+        let mut block = hosting(running("claude", CLAUDE), "claude", status, false);
+        block.agent.as_mut().unwrap().updated_ms = updated_ms;
+        look(block, false)
     }
 
     fn look(block: TerminalBlock, active: bool) -> Option<Look> {
@@ -2217,6 +2287,7 @@ mod tests {
         Goal {
             until: until.to_vec(),
             needs_activity,
+            answers: None,
             timeout: timeout_ms.map(Duration::from_millis),
         }
     }
@@ -2250,6 +2321,53 @@ mod tests {
             (Blocked, 1),
             "blocking is a reaction too"
         );
+    }
+
+    #[test]
+    fn a_prompt_answering_a_blocked_agent_waits_for_a_new_state() {
+        // A Claude background agent shows the question it asked until its next
+        // turn starts, and reports nothing while it runs.
+        let answering = |at: Option<u64>| Goal {
+            answers: Some(at),
+            ..goal(&SETTLED, true, None)
+        };
+        let (outcome, waits, _) =
+            wait_for(&[background(Blocked, Some(100))], &answering(Some(100)));
+        assert_eq!(
+            (outcome.unwrap_err().code, waits.len()),
+            ("agent_prompt_stalled", 5),
+            "the question it asked is no reaction"
+        );
+        let looks = [
+            background(Blocked, Some(100)),
+            background(Working, Some(100)),
+            background(Done, Some(300)),
+        ];
+        let (outcome, waits, _) = wait_for(&looks, &answering(Some(100)));
+        assert_eq!((outcome.unwrap().status(), waits.len()), (Done, 3));
+        for (at, looks) in [
+            (
+                Some(100),
+                [
+                    background(Blocked, Some(100)),
+                    background(Blocked, Some(200)),
+                ],
+            ),
+            (
+                None,
+                [background(Blocked, None), background(Blocked, Some(200))],
+            ),
+        ] {
+            let (outcome, waits, _) = wait_for(&looks, &answering(at));
+            assert_eq!(
+                (
+                    outcome.unwrap().block.agent.unwrap().updated_ms,
+                    waits.len()
+                ),
+                (Some(200), 2),
+                "a new question, after a turn too short to see: {at:?}"
+            );
+        }
     }
 
     #[test]

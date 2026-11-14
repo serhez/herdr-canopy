@@ -467,14 +467,20 @@ ln -s "$PWD/rex/skills/rex-agents" ~/.claude/skills/rex-agents
   them this means starting up or waiting at a startup dialog, such as a folder
   trust or hooks prompt.
 - A Claude background agent runs in Claude's own daemon, so a pane viewing it
-  (`claude attach`, or the `claude agents` view) reports nothing. Canopy reads
-  its state from Claude's job file (`$CLAUDE_CONFIG_DIR/jobs/ID/state.json`, by
-  default under `~/.claude`): the file of the one job whose name is the pane's
-  title, else, for `claude attach ID`, of job ID. Claude counts such an agent as
-  blocked at a dialog and also when its last reply ends on a question or request
-  for the user, so `prompt` refuses it then; and as working while it waits on
-  its background tasks. It shows as unknown in the `claude agents` list and when
-  its file cannot be read. Such agents have no working timer.
+  reports nothing: `claude attach`, the `claude agents` view, or a Claude
+  session moved to the background, whose process stays to show it. Canopy
+  reads its state from Claude's files (`$CLAUDE_CONFIG_DIR`, by default
+  `~/.claude`): the job file `jobs/ID/state.json` of the one job whose name is
+  the title Claude set on the pane, else of the job the process opened (`claude
+  attach ID`, or the job its file in `sessions/` names). Claude counts such an
+  agent as working while it waits on its background tasks, and as blocked both
+  at a dialog and when its last reply ends on a question or request for the
+  user. In the second case, when every Claude process running the job is at
+  rest, its `blocked_kind` is `reply` and `prompt` answers it; otherwise
+  `prompt` refuses it. While a prompt's answer starts, the agent still shows
+  its question, so `prompt --wait` counts only a newer block as a reaction. It
+  shows as unknown in the `claude agents` list and when its files cannot be
+  read. Such agents have no working timer.
 - Rex reports neither the window's size nor its pane frame (header and
   padding), so Canopy estimates the window from the pane it opens from and
   learns the frame from each popup. The first popup on a server, or after a

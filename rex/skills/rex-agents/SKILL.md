@@ -21,11 +21,12 @@ startup dialog, or reporting nothing).
 herdr-canopy rex agent prompt reviewer "From planner: review the diff; end your turn with the findings." --wait --timeout 600000
 ```
 
-The agent sees your prompt as if the user typed it, and answers on its screen.
+The agent sees your prompt as the user's and answers on its screen.
 Say who you are (your name or `$REX_BLOCK`) and ask it to end its turn with
 its answer or a question.
 
-- `prompt TARGET TEXT` refuses `blocked` agents and a starting Claude or Codex.
+- `prompt TARGET TEXT` refuses `blocked` agents (unless `blocked_kind` is
+  `reply`: its last message asked something) and a starting Claude or Codex.
   `--wait` returns at `idle`, `done` or `blocked` (or `--until STATE`); a
   resting agent must start working within 5 s.
 - `wait TARGET [--until STATE]… [--timeout MS]` waits without sending.
@@ -64,5 +65,5 @@ merged or saved (`worktree-sync rex remove --session SESSION --yes
 unless asked. A failed `start` shows the block's last lines. Skill `rex`
 covers the rest of Rex.
 
-Ask the user before answering an approval, trust or hooks prompt, unless more
-specific instructions (the user's or a skill's) say otherwise.
+Ask the user before answering an approval, trust or hooks prompt, unless the user
+or another skill says otherwise.

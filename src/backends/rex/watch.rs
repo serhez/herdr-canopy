@@ -236,6 +236,7 @@ impl Watch {
         let state = info.agent_state(None, &|_, _| None);
         let status = state.as_ref().map_or(AgentStatus::Unknown, |s| s.status);
         let record = state.as_ref().and_then(|s| s.record);
+        let updated_ms = state.as_ref().and_then(|s| s.updated_ms);
         let owner_pid = record.map(|r| r.owner_pid);
         let timed = state
             .as_ref()
@@ -244,7 +245,7 @@ impl Watch {
         let working = status == AgentStatus::Working;
         let finished = record
             .filter(|r| r.clears_when_seen)
-            .map(|r| (status, r.updated_ms));
+            .map(|_| (status, updated_ms));
         let previous = self.blocks.insert(
             block.clone(),
             Tracked {
@@ -284,7 +285,7 @@ impl Watch {
                 if self.periods.get(&block).is_some_and(same) || continues {
                     return effects;
                 }
-                let started_ms = record.and_then(|r| r.updated_ms).unwrap_or(now_ms);
+                let started_ms = updated_ms.unwrap_or(now_ms);
                 self.periods.insert(
                     block,
                     Period {
