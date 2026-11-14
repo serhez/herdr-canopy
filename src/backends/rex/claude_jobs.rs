@@ -131,9 +131,9 @@ fn named_job(name: &str, jobs: &Path) -> Option<(String, StateFile)> {
     named.next().is_none().then_some(job)
 }
 
-/// Whether Claude processes run job `id` and all are at rest, idle or idle
-/// with background shells: none shows a dialog or runs a turn. Not when a
-/// process file cannot be read, since its process might.
+/// Whether Claude processes run job `id` and all are idle: none shows a dialog,
+/// runs a turn or has background shells. Not when a process file cannot be
+/// read, since its process might.
 fn at_rest(id: &str, sessions: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(sessions) else {
         return false;
@@ -151,7 +151,7 @@ fn at_rest(id: &str, sessions: &Path) -> bool {
             return false;
         };
         if process.job_id.as_deref() == Some(id) {
-            if !matches!(process.status.as_deref(), Some("idle" | "shell")) {
+            if process.status.as_deref() != Some("idle") {
                 return false;
             }
             found = true;
@@ -175,6 +175,10 @@ struct StateFile {
     updated_at: Option<String>,
     needs: Option<String>,
     detail: Option<String>,
+    /// The agent's background work (`tasks`: shells, subagents, monitors,
+    /// scheduled wake-ups) and messages waiting to start a turn (`queued`).
+    /// Read loosely, since a status must not depend on it.
+    in_flight: Option<serde_json::Value>,
 }
 
 impl StateFile {
@@ -189,9 +193,16 @@ impl StateFile {
         };
         // Claude marks a job blocked both at a dialog, where typed text could
         // pick an option, and once its last reply ended on a question; only
-        // then are its processes at rest.
+        // then are its processes at rest. Background work could open a dialog
+        // without a turn of the agent's own, and a queued message start one.
+        let no_work = self.in_flight.is_some_and(|work| {
+            ["tasks", "queued"]
+                .iter()
+                .all(|count| work[count].as_f64() == Some(0.0))
+        });
         if job.state == "blocked"
             && job.status() == Some((AgentStatus::Blocked, false))
+            && no_work
             && at_rest(id, sessions)
         {
             job.blocked_kind = Some(REPLY);
@@ -588,21 +599,21 @@ mod tests {
             .blocked_kind
     }
 
+    /// A job whose last reply ended on a question, with no background work.
+    const QUESTION: &str = r#"{"state": "blocked", "tempo": "blocked", "name": "Pilot plan",
+        "needs": "Should I go ahead?", "inFlight": {"tasks": 0, "queued": 0, "kinds": []}}"#;
+
     #[test]
     fn a_job_whose_reply_ended_on_a_question_waits_for_a_prompt() {
-        // Its turn ended, so its processes are at rest; at a dialog they wait.
+        // Its turn ended and no background work runs, so nothing can open a
+        // dialog before a prompt starts a turn.
         let idle = worker("8bb03a8b", "idle");
-        let shell = worker("8bb03a8b", "shell");
         let others = worker("17f1a30e", "waiting");
         let parked = r#"{"pid": 65434, "kind": "interactive", "status": "busy",
                          "parkedJobId": "8bb03a8b"}"#;
         for processes in [
             vec![("60649.json", idle.as_str())],
-            vec![("60649.json", shell.as_str())],
-            vec![
-                ("60649.json", idle.as_str()),
-                ("60650.json", shell.as_str()),
-            ],
+            vec![("60649.json", idle.as_str()), ("60650.json", idle.as_str())],
             vec![
                 ("60649.json", idle.as_str()),
                 ("94957.json", others.as_str()),
@@ -613,11 +624,15 @@ mod tests {
                 ("60649.0da5f5ce.key", "not json"),
             ],
         ] {
-            assert_eq!(blocked_kind(PLAN, &processes), Some(REPLY), "{processes:?}");
+            assert_eq!(
+                blocked_kind(QUESTION, &processes),
+                Some(REPLY),
+                "{processes:?}"
+            );
         }
-        let undated = r#"{"state": "blocked"}"#;
+        let untimed = r#"{"state": "blocked", "inFlight": {"tasks": 0, "queued": 0, "kinds": []}}"#;
         assert_eq!(
-            blocked_kind(undated, &[("60649.json", &idle)]),
+            blocked_kind(untimed, &[("60649.json", &idle)]),
             Some(REPLY),
             "without a tempo, the state decides"
         );
@@ -640,15 +655,15 @@ mod tests {
             ],
             vec![("60649.json", idle.as_str()), ("60650.json", "{\"pid\": 6")],
         ] {
-            assert_eq!(blocked_kind(PLAN, &processes), None, "{processes:?}");
+            assert_eq!(blocked_kind(QUESTION, &processes), None, "{processes:?}");
         }
         for state_file in [
             // A dialog during a turn that follows a working one.
-            r#"{"state": "working", "tempo": "blocked"}"#,
+            r#"{"state": "working", "tempo": "blocked", "inFlight": {"tasks": 0, "queued": 0}}"#,
             // A prompt arrived: the turn runs.
-            r#"{"state": "blocked", "tempo": "active"}"#,
-            r#"{"state": "failed", "tempo": "idle"}"#,
-            r#"{"state": "done"}"#,
+            r#"{"state": "blocked", "tempo": "active", "inFlight": {"tasks": 0, "queued": 0}}"#,
+            r#"{"state": "failed", "tempo": "idle", "inFlight": {"tasks": 0, "queued": 0}}"#,
+            r#"{"state": "done", "inFlight": {"tasks": 0, "queued": 0}}"#,
         ] {
             assert_eq!(
                 blocked_kind(state_file, &[("60649.json", &idle)]),
@@ -656,10 +671,44 @@ mod tests {
                 "{state_file}"
             );
         }
-        let config = jobs_with(PLAN);
+        let config = jobs_with(QUESTION);
         fs::remove_dir(config.path().join("sessions")).unwrap();
         let shown = shown(&["claude", "attach", "8bb03a8b"], None, config.path());
         assert_eq!(shown.unwrap().blocked_kind, None, "no process files");
+    }
+
+    #[test]
+    fn a_job_with_background_work_waits_for_something_unknown() {
+        // Background shells, subagents and monitors can open a dialog (network
+        // access, a subagent's permission) with no turn of the agent's own.
+        let with_in_flight = |in_flight: &str| {
+            format!(r#"{{"state": "blocked", "tempo": "blocked", "inFlight": {in_flight}}}"#)
+        };
+        let idle = worker("8bb03a8b", "idle");
+        for state_file in [
+            with_in_flight(r#"{"tasks": 1, "queued": 0, "kinds": ["local_bash"]}"#),
+            with_in_flight(r#"{"tasks": 2, "queued": 0, "kinds": ["local_agent", "monitor"]}"#),
+            // A message waits to start a turn.
+            with_in_flight(r#"{"tasks": 0, "queued": 1, "kinds": []}"#),
+            with_in_flight(r#"{"tasks": "none", "queued": 0}"#),
+            with_in_flight(r#"{"queued": 0}"#),
+            with_in_flight("null"),
+            r#"{"state": "blocked", "tempo": "blocked"}"#.to_string(),
+        ] {
+            let config = config(&[("8bb03a8b", &state_file)], &[("60649.json", &idle)]);
+            let shown = shown(&["claude", "attach", "8bb03a8b"], None, config.path());
+            assert_eq!(
+                shown.map(|job| (job.status(), job.blocked_kind)),
+                Some((Some((AgentStatus::Blocked, false)), None)),
+                "{state_file}"
+            );
+        }
+        let shell = worker("8bb03a8b", "shell");
+        assert_eq!(
+            blocked_kind(QUESTION, &[("60649.json", &shell)]),
+            None,
+            "idle with background shells"
+        );
     }
 
     #[test]

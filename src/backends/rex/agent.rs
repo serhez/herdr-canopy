@@ -562,30 +562,7 @@ fn prompt(server: &Server, args: PromptArgs, elapsed: &dyn Fn() -> Duration) -> 
     let view = server.load()?;
     let (block, state) = view.resolve(&args.target)?;
     let agent = label(block);
-    // A Claude background agent whose last reply ended on a question waits for
-    // a prompt, though Claude counts it as blocked.
-    let answers_reply =
-        state.record.is_none() && state.blocked_kind.as_deref() == Some(claude_jobs::REPLY);
-    match state.status {
-        AgentStatus::Blocked if !answers_reply => {
-            let waiting = state.blocked_kind.as_deref().unwrap_or("input");
-            return Err(Failure::new(
-                "agent_blocked",
-                format!(
-                    "agent {agent} is blocked waiting for {waiting}: read its screen and answer that first"
-                ),
-            ));
-        }
-        AgentStatus::Unknown if REPORTING.contains(&state.agent) => {
-            return Err(Failure::new(
-                "agent_not_ready",
-                format!(
-                    "agent {agent} has not reported its state: it may be starting or at a startup dialog; read its screen"
-                ),
-            ));
-        }
-        _ => {}
-    }
+    promptable(state, agent)?;
     let pid = state.pid.ok_or_else(|| not_running(agent))?;
     let _waiting = if args.wait {
         view.wait_on(server, block)?
@@ -604,6 +581,15 @@ fn prompt(server: &Server, args: PromptArgs, elapsed: &dyn Fn() -> Duration) -> 
         }
         submitted = true;
         let _lock = input_lock(&view.state_dir, &block.block_id)?;
+        // Another sender's prompt may have changed the agent since it was
+        // checked; the lock keeps one from doing so until this one is typed.
+        let last = view.observe(server, block, Duration::ZERO)?;
+        let now = last
+            .as_ref()
+            .and_then(|look| look.block.agent.as_ref())
+            .filter(|now| now.pid == Some(pid))
+            .ok_or_else(|| not_running(agent))?;
+        promptable(now, agent)?;
         match view.look(server, block, wait, Some(&input))? {
             Found::Look(look) => Ok(Some(*look)),
             Found::Refused | Found::Gone => Err(not_running(agent)),
@@ -621,6 +607,33 @@ fn prompt(server: &Server, args: PromptArgs, elapsed: &dyn Fn() -> Duration) -> 
         observe(Duration::ZERO)?.ok_or_else(|| not_running(agent))?
     };
     Ok(json!({"type": "agent_prompted", "agent": view.info(&look.block)}))
+}
+
+/// Fails unless the agent in `state` can take a prompt: not blocked at an
+/// approval or question, where typed text could pick an option (a Claude
+/// background agent waiting on the question its reply ended on can), and not
+/// a Claude or Codex that has not reported, which may be at a startup dialog.
+fn promptable(state: &AgentState, agent: &str) -> Result<(), Failure> {
+    let answers_reply =
+        state.record.is_none() && state.blocked_kind.as_deref() == Some(claude_jobs::REPLY);
+    match state.status {
+        AgentStatus::Blocked if !answers_reply => {
+            let waiting = state.blocked_kind.as_deref().unwrap_or("input");
+            Err(Failure::new(
+                "agent_blocked",
+                format!(
+                    "agent {agent} is blocked waiting for {waiting}: read its screen and answer that first"
+                ),
+            ))
+        }
+        AgentStatus::Unknown if REPORTING.contains(&state.agent) => Err(Failure::new(
+            "agent_not_ready",
+            format!(
+                "agent {agent} has not reported its state: it may be starting or at a startup dialog; read its screen"
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn wait(server: &Server, args: WaitArgs, elapsed: &dyn Fn() -> Duration) -> Reply {
@@ -1490,9 +1503,11 @@ mod tests {
         assert_eq!(
             fixture.agent_calls(),
             [
+                json!({"session_id": "session:pad", "block_id": "block:claude", "wait_s": 0.0}),
                 json!({"session_id": "session:pad", "block_id": "block:claude", "wait_s": 0.0,
                     "submit": {"text": "Review the diff", "pid": 30, "at_prompt": false}})
-            ]
+            ],
+            "a last look before typing"
         );
         assert!(
             fixture.state_dir().join("input/block:claude.lock").exists(),
@@ -1525,6 +1540,44 @@ mod tests {
             fixture.agent_calls().is_empty() && starting.agent_calls().is_empty(),
             "nothing is sent"
         );
+    }
+
+    #[test]
+    fn a_prompt_checks_the_agent_again_right_before_typing() {
+        // Another sender's prompt may have changed it meanwhile, such as into a
+        // dialog that typed text would answer.
+        let fixture = Fixture::new(&snapshot());
+        let look_only =
+            || json!({"session_id": "session:pad", "block_id": "block:claude", "wait_s": 0.0});
+        let mut asking = record("blocked", "claude-code", 30);
+        asking["kind"] = json!("permission");
+        let now =
+            |pid: u32, records: Value| looked(info(("claude", pid), &[("zsh", 3)], records), false);
+        for (look, code) in [
+            (now(30, json!([asking])), "agent_blocked"),
+            (now(30, json!({})), "agent_not_ready"),
+            (
+                now(31, json!([record("idle", "claude-code", 31)])),
+                "agent_not_running",
+            ),
+            (
+                looked(info(("zsh", 3), &[], json!({})), false),
+                "agent_not_running",
+            ),
+        ] {
+            fixture.fake.answer("agent", &look);
+            let before = fixture.agent_calls().len();
+            assert_eq!(
+                fixture.run(&["prompt", "reviewer", "go"]).unwrap_err().code,
+                code,
+                "{look}"
+            );
+            assert_eq!(
+                fixture.agent_calls()[before..],
+                [look_only()],
+                "looked at, nothing sent: {look}"
+            );
+        }
     }
 
     /// A Claude background agent whose last reply ended on a question.
@@ -1564,7 +1617,7 @@ mod tests {
         let reply = fixture.run(&["prompt", "reviewer", "Yes"]).unwrap();
         assert_eq!(reply["agent"]["blocked_kind"], "reply");
         assert_eq!(
-            fixture.agent_calls(),
+            fixture.agent_calls()[1..],
             [
                 json!({"session_id": "session:pad", "block_id": "block:claude", "wait_s": 0.0,
                     "submit": {"text": "Yes", "pid": 30, "at_prompt": false}})
@@ -1581,7 +1634,7 @@ mod tests {
         );
         let reply = fixture.run(&["prompt", "helper", "hi"]).unwrap();
         assert_eq!(reply["agent"]["agent_status"], "unknown");
-        assert_eq!(fixture.agent_calls()[0]["submit"]["pid"], 50);
+        assert_eq!(fixture.agent_calls()[1]["submit"]["pid"], 50);
     }
 
     #[test]
@@ -1618,9 +1671,9 @@ mod tests {
             "it worked during the submission's look, then settled"
         );
         let calls = fixture.agent_calls();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 2, "a last look, then the submission");
         assert_eq!(
-            calls[0]["wait_s"], 1.0,
+            calls[1]["wait_s"], 1.0,
             "the submission's look waits for the agent to react"
         );
     }
@@ -1729,7 +1782,7 @@ mod tests {
         let _reviewer = waiting(&fixture, "block:claude", "block:me");
         fixture.fake.answer("agent", &reviewer_look("working"));
         fixture.run(&["prompt", "reviewer", "my answer"]).unwrap();
-        assert_eq!(fixture.agent_calls()[0]["submit"]["text"], "my answer");
+        assert_eq!(fixture.agent_calls()[1]["submit"]["text"], "my answer");
     }
 
     #[test]

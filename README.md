@@ -429,7 +429,9 @@ and error codes:
 An agent's name is its block's label; a block with Rex's default label, such as
 `shell`, has none. A TARGET is a block id, a name, or `SESSION/NAME` with the
 session's label. Prompts, keys and starts to one block take turns through a lock
-in Canopy's state directory, so two senders never mix their input.
+in Canopy's state directory, so two senders never mix their input. Once `prompt`
+holds the lock, it checks the agent again right before typing, since another
+sender's prompt may have changed it.
 
 Differences from Herdr:
 
@@ -475,12 +477,14 @@ ln -s "$PWD/rex/skills/rex-agents" ~/.claude/skills/rex-agents
   attach ID`, or the job its file in `sessions/` names). Claude counts such an
   agent as working while it waits on its background tasks, and as blocked both
   at a dialog and when its last reply ends on a question or request for the
-  user. In the second case, when every Claude process running the job is at
-  rest, its `blocked_kind` is `reply` and `prompt` answers it; otherwise
-  `prompt` refuses it. While a prompt's answer starts, the agent still shows
-  its question, so `prompt --wait` counts only a newer block as a reaction. It
-  shows as unknown in the `claude agents` list and when its files cannot be
-  read. Such agents have no working timer.
+  user. In the second case, its `blocked_kind` is `reply` and `prompt` answers
+  it when every Claude process running it is idle, no message waits to start a
+  turn, and it has no background work (shells, subagents, monitors, scheduled
+  wake-ups), which could open a dialog without a turn of its own; otherwise
+  `prompt` refuses it until that changes. While a prompt's answer starts, the
+  agent still shows its question, so `prompt --wait` counts only a newer block
+  as a reaction. It shows as unknown in the `claude agents` list and when its
+  files cannot be read. Such agents have no working timer.
 - Rex reports neither the window's size nor its pane frame (header and
   padding), so Canopy estimates the window from the pane it opens from and
   learns the frame from each popup. The first popup on a server, or after a
